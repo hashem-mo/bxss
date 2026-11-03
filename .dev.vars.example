@@ -1,0 +1,14 @@
+# Generate real values with: npm run dev:init
+AUTH_PEPPER=replace-with-32-random-bytes-base64url
+DATA_ENCRYPTION_KEY=replace-with-32-random-bytes-base64url
+BOOTSTRAP_TOKEN=replace-with-32-random-bytes-base64url
+
+# Optional production hardening. Leave unset for local development.
+# APP_ORIGIN=https://console.example.com
+# RP_ID=console.example.com
+# COLLECTOR_ORIGIN=https://collector.example.com
+# CF_ACCESS_TEAM_DOMAIN=https://your-team.cloudflareaccess.com
+# CF_ACCESS_AUD=your-access-application-audience-tag
+
+# Optional metadata-only Discord notifications. Never commit a real webhook.
+# DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/WEBHOOK_ID/WEBHOOK_TOKEN

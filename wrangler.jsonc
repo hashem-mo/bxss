@@ -1,0 +1,77 @@
+{
+	"$schema": "./node_modules/wrangler/config-schema.json",
+	"name": "bxss-vault",
+	"workers_dev": true,
+	
+	"main": "src/worker.ts",
+	"preview_urls": false,
+	"compatibility_date": "2026-08-11",
+	"compatibility_flags": [
+		"nodejs_compat"
+	],
+	"assets": {
+		"directory": "./dist",
+		"binding": "ASSETS",
+		"run_worker_first": true,
+		"not_found_handling": "single-page-application"
+	},
+	"d1_databases": [
+		{
+			"binding": "DB",
+			"migrations_dir": "migrations",
+			"database_name": "bxss-vault-db",
+			"database_id": "a8ccda45-12c2-4d9a-bfbd-e5fd0f169d9a"
+		}
+	],
+	"r2_buckets": [
+		{
+			"binding": "VAULT",
+			"bucket_name": "bxss-vault-vault"
+		}
+	],
+	"ratelimits": [
+		{
+			"name": "COLLECTOR_RATE_LIMITER",
+			"namespace_id": "21001",
+			"simple": {
+				"limit": 120,
+				"period": 60
+			}
+		},
+		{
+			"name": "AUTH_RATE_LIMITER",
+			"namespace_id": "21002",
+			"simple": {
+				"limit": 20,
+				"period": 60
+			}
+		}
+	],
+	"vars": {
+		"APP_ORIGIN": "https://bxss-vault.hm0.workers.dev",
+"RP_ID": "bxss-vault.hm0.workers.dev",
+"COLLECTOR_ORIGIN": "https://bxss-vault.hm0.workers.dev",
+		"RP_NAME": "BXSS Vault",
+		"SESSION_IDLE_SECONDS": "900",
+		"SESSION_ABSOLUTE_SECONDS": "14400",
+		"MAX_CAPTURE_BYTES": "20971520",
+		"MAX_STORAGE_BYTES": "8053063680",
+		"MAX_EVENTS_PER_DAY": "5000",
+		"RETENTION_DAYS": "5000"
+	},
+	"secrets": {
+		"required": [
+			"AUTH_PEPPER",
+			"DATA_ENCRYPTION_KEY",
+			"BOOTSTRAP_TOKEN"
+		]
+	},
+	"triggers": {
+		"crons": [
+			"*/5 * * * *"
+		]
+	},
+	"observability": {
+		"enabled": false
+	}
+}

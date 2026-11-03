@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="light" />
+    <meta name="referrer" content="no-referrer" />
+    <meta name="robots" content="noindex, nofollow, noarchive" />
+    <title>Sign in</title>
+  </head>
+  <body>
+    <main class="login-shell">
+      <section class="login-card" aria-labelledby="login-title">
+        <div id="loading-panel" class="login-panel">
+          <h1 id="login-title">Sign in</h1>
+          <p class="login-copy">Checking account status.</p>
+          <span class="login-spinner" role="status" aria-label="Loading"></span>
+        </div>
+
+        <div id="error-message" class="login-error" role="alert" hidden></div>
+
+        <div id="signin-panel" class="login-panel" hidden>
+          <h1>Sign in</h1>
+          <p class="login-copy">Use your registered passkey to continue.</p>
+          <button id="signin-button" class="login-primary" type="button">Continue with passkey</button>
+          <button id="show-recovery-button" class="login-link" type="button">Account recovery</button>
+        </div>
+
+        <form id="recovery-panel" class="login-panel login-form" hidden>
+          <h1>Account recovery</h1>
+          <label>Email <input id="recovery-email" type="email" autocomplete="username" maxlength="254" required /></label>
+          <label>Recovery code <input id="recovery-code" class="login-mono" type="text" autocomplete="one-time-code" minlength="20" maxlength="80" required /></label>
+          <button class="login-primary" type="submit">Register replacement passkey</button>
+          <button id="hide-recovery-button" class="login-link" type="button">Back</button>
+        </form>
+
+        <form id="bootstrap-panel" class="login-panel login-form" hidden>
+          <h1>Initialize owner</h1>
+          <label>Bootstrap token <input id="bootstrap-token" class="login-mono" type="password" autocomplete="off" minlength="32" required /></label>
+          <label>Owner name <input id="bootstrap-name" type="text" autocomplete="name" maxlength="80" required /></label>
+          <label>Owner email <input id="bootstrap-email" type="email" autocomplete="username" maxlength="254" required /></label>
+          <label>Passkey name <input id="bootstrap-passkey" type="text" value="Primary passkey" maxlength="80" required /></label>
+          <button class="login-primary" type="submit">Create owner passkey</button>
+        </form>
+
+        <div id="secrets-panel" class="login-panel" hidden>
+          <h1>Save these values</h1>
+          <p class="login-copy">They will not be shown again. Store them in separate secure locations.</p>
+          <section class="login-secret-group">
+            <div class="login-secret-heading"><h2>Recovery codes</h2><button id="copy-codes-button" class="login-copy-button" type="button">Copy</button></div>
+            <div id="recovery-codes" class="login-code-grid"></div>
+          </section>
+          <section class="login-secret-group">
+            <div class="login-secret-heading"><h2>Collector token</h2><button id="copy-token-button" class="login-copy-button" type="button">Copy</button></div>
+            <code id="collector-token" class="login-token"></code>
+          </section>
+          <button id="copy-all-button" class="login-copy-button login-copy-all" type="button">Copy all</button>
+          <label class="login-confirm"><input id="secrets-confirmed" type="checkbox" /><span>I saved these values securely.</span></label>
+          <button id="open-dashboard-button" class="login-primary" type="button" disabled>Continue</button>
+        </div>
+      </section>
+      <small id="rp-name">Private access</small>
+    </main>
+    <script type="module" src="/src/client/login.ts"></script>
+  </body>
+</html>

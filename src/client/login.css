@@ -1,0 +1,30 @@
+:root { color-scheme: light; font: 16px/1.5 system-ui, sans-serif; color: #171717; background: #f3f3f3; }
+* { box-sizing: border-box; }
+body { min-width: 320px; min-height: 100vh; margin: 0; }
+[hidden] { display: none !important; }
+.login-shell { width: min(25rem, calc(100% - 2rem)); margin: 12vh auto 0; }
+.login-card { padding: 1.5rem; border: 1px solid #aaa; background: #fff; }
+.login-panel h1 { margin: 0 0 .5rem; font-size: 1.35rem; }
+.login-panel h2 { margin: 0; font-size: 1rem; }
+.login-copy, #rp-name { color: #555; }
+#rp-name { display: block; margin-top: .6rem; text-align: center; font-size: .75rem; }
+.login-form:not([hidden]) { display: grid; gap: .8rem; }
+.login-form label { font-size: .85rem; }
+button, input { width: 100%; min-height: 2.65rem; font: inherit; }
+input { display: block; margin-top: .25rem; padding: .45rem .55rem; border: 1px solid #777; background: #fff; color: #111; }
+button { border: 1px solid #777; background: #eee; color: #111; cursor: pointer; }
+button:disabled, html[data-busy="true"] button { cursor: wait; opacity: .55; }
+button:focus-visible, input:focus-visible { outline: 3px solid #555; outline-offset: 2px; }
+.login-link { margin-top: .65rem; border: 0; background: transparent; text-decoration: underline; }
+.login-error { margin-bottom: 1rem; padding: .65rem; border: 1px solid #900; color: #700; background: #fff5f5; }
+.login-spinner { display: block; width: 1.25rem; height: 1.25rem; margin: .75rem auto 0; border: 2px solid #aaa; border-top-color: #222; border-radius: 50%; animation: spin .7s linear infinite; }
+@keyframes spin { to { transform: rotate(360deg); } }
+.login-secret-group { margin: 1rem 0; padding: .75rem; border: 1px solid #aaa; }
+.login-secret-heading { display: flex; align-items: center; justify-content: space-between; gap: 1rem; margin-bottom: .5rem; }
+.login-copy-button { width: auto; min-height: 2rem; padding: 0 .6rem; }
+.login-copy-all { width: 100%; }
+.login-code-grid { display: grid; gap: .35rem; }
+.login-code-grid code, .login-token { display: block; overflow-wrap: anywhere; padding: .4rem; border: 1px solid #ccc; background: #f6f6f6; font: .75rem ui-monospace, monospace; }
+.login-mono { font-family: ui-monospace, monospace; }
+.login-confirm { display: flex; gap: .5rem; margin: 1rem 0; font-size: .85rem; }
+.login-confirm input { width: 1rem; min-height: 1rem; margin: .2rem 0 0; }
