@@ -9,6 +9,12 @@ interface ExpiredEventRow {
   screenshot_bytes: number;
 }
 
+interface ExpiredOobRow {
+  id: string;
+  detail_key: string;
+  detail_bytes: number;
+}
+
 const BATCH_SIZE = 20;
 
 function changes(result: D1Result<unknown>): number {
@@ -65,6 +71,48 @@ export async function runRetention(env: Env): Promise<void> {
         `INSERT INTO audit_log
           (user_id, action, target_type, target_id, result, metadata_json, created_at)
          VALUES (NULL, 'retention.sweep', 'event', NULL, 'success', ?, ?)`,
+      )
+        .bind(JSON.stringify({ deleted }), now)
+        .run();
+    }
+  }
+
+  // Out-of-band interactions share the encrypted R2 budget and the same cutoff.
+  // A second bounded batch drains them on the same schedule.
+  const expiredOob = await env.DB.prepare(
+    `SELECT id, detail_key, detail_bytes
+       FROM oob_interactions
+      WHERE received_at < ?
+      ORDER BY received_at ASC, id ASC
+      LIMIT ?`,
+  )
+    .bind(cutoff, BATCH_SIZE)
+    .all<ExpiredOobRow>();
+
+  if (expiredOob.results.length > 0) {
+    const keys = expiredOob.results.map((interaction) => interaction.detail_key);
+    if (keys.length > 0) await env.VAULT.delete(keys);
+
+    const statements: D1PreparedStatement[] = [];
+    for (const interaction of expiredOob.results) {
+      const bytes = Math.max(0, Number(interaction.detail_bytes));
+      statements.push(
+        env.DB.prepare('DELETE FROM oob_interactions WHERE id = ?').bind(interaction.id),
+        env.DB.prepare(
+          `UPDATE app_state
+              SET storage_bytes = MAX(0, storage_bytes - (? * changes())), updated_at = ?
+            WHERE id = 1`,
+        ).bind(bytes, now),
+      );
+    }
+    const results = await env.DB.batch(statements);
+    const deleted = results.filter((_, index) => index % 2 === 0).reduce((count, result) => count + changes(result), 0);
+
+    if (deleted > 0) {
+      await env.DB.prepare(
+        `INSERT INTO audit_log
+          (user_id, action, target_type, target_id, result, metadata_json, created_at)
+         VALUES (NULL, 'retention.sweep', 'oob_interaction', NULL, 'success', ?, ?)`,
       )
         .bind(JSON.stringify({ deleted }), now)
         .run();

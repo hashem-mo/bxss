@@ -1,6 +1,7 @@
 import { createCipheriv, createHmac, randomBytes, randomUUID } from 'node:crypto';
 import { readFile, writeFile } from 'node:fs/promises';
 import { spawnSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 
 const vars = Object.fromEntries(
   (await readFile(new URL('../.dev.vars', import.meta.url), 'utf8'))
@@ -77,8 +78,8 @@ VALUES
    ${sqlValue(keyedHash('injection-api-token', injectionToken))}, 'injection:write', ${current});
 `;
 
-const wrangler = new URL('../node_modules/wrangler/bin/wrangler.js', import.meta.url);
-const executed = spawnSync(process.execPath, [wrangler.pathname.slice(1), 'd1', 'execute', 'DB', '--local', '--command', sql], {
+const wrangler = fileURLToPath(new URL('../node_modules/wrangler/bin/wrangler.js', import.meta.url));
+const executed = spawnSync(process.execPath, [wrangler, 'd1', 'execute', 'DB', '--local', '--command', sql], {
   cwd: new URL('..', import.meta.url),
   encoding: 'utf8',
   windowsHide: true,

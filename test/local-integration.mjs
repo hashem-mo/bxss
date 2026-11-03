@@ -1,5 +1,6 @@
 import { readFile, rm } from 'node:fs/promises';
 import { spawnSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 
 const secretsUrl = new URL('./.integration-secrets.json', import.meta.url);
 const secrets = JSON.parse(await readFile(secretsUrl, 'utf8'));
@@ -234,11 +235,78 @@ try {
   const injectionBody = await injectionExport.json();
   assert(injectionBody.requests?.[0]?.data?.request === injectionRequest, 'unmatched/matched injection export is incomplete');
 
+  // --- Out-of-band interaction server --------------------------------------
+  const createdProbe = await fetch(`${origin}/api/oob`, {
+    method: 'POST',
+    headers: mutationHeaders,
+    body: JSON.stringify({ name: 'Integration OOB listener' }),
+  });
+  assert(createdProbe.status === 201, `oob listener creation returned ${createdProbe.status}`);
+  const probe = (await createdProbe.json()).probe;
+  assert(/^[a-z2-7]{26}$/.test(probe.token), 'oob token is not a canonical base32 token');
+  assert(probe.pathLoaderUrl === `${origin}/o/${probe.token}`, 'oob path loader URL is wrong');
+
+  const oobCallback = await fetch(`${origin}/o/${probe.token}/blind-rce?x=1`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'X-Synthetic-Oob': 'yes' },
+    body: JSON.stringify({ probe: 'oob' }),
+  });
+  assert(oobCallback.status === 200, `oob callback returned ${oobCallback.status}`);
+  assert((await oobCallback.text()) === '', 'oob endpoint reflected a response body');
+  assert(oobCallback.headers.get('access-control-allow-origin') === '*', 'oob endpoint is missing permissive CORS');
+
+  // Unknown but well-formed tokens get the same uniform response: no enumeration signal.
+  const unknownOob = await fetch(`${origin}/o/aaaaaaaaaaaaaaaaaaaaaaaaaa`);
+  assert(unknownOob.status === 200, `unknown oob token returned ${unknownOob.status}`);
+
+  const oobList = await (await fetch(`${origin}/api/oob/interactions?probeId=${probe.id}`, { headers: authHeaders })).json();
+  assert(oobList.interactions?.length === 1, 'oob interaction was not indexed exactly once');
+  const oobInteractionId = oobList.interactions[0].id;
+  const oobSummary = oobList.interactions[0].summary;
+  assert(oobSummary.method === 'POST', 'oob summary method did not round-trip');
+  assert(oobSummary.path === `/o/${probe.token}/blind-rce`, 'oob summary path did not round-trip');
+  assert(oobSummary.query === 'x=1', 'oob summary query did not round-trip');
+  assert(oobSummary.matchedBy === 'path', 'oob summary match source did not round-trip');
+
+  const viewedOob = await (await fetch(`${origin}/api/oob/interactions/${oobInteractionId}`, { headers: authHeaders })).json();
+  const oobDetail = viewedOob.interaction.detail;
+  assert(oobDetail.body === JSON.stringify({ probe: 'oob' }), 'encrypted oob body did not round-trip');
+  assert(
+    Array.isArray(oobDetail.headers) && oobDetail.headers.some((header) => header.name === 'x-synthetic-oob' && header.value === 'yes'),
+    'encrypted oob header did not round-trip',
+  );
+
+  const oobExport = await (await fetch(`${origin}/api/export/oob`, { headers: authHeaders })).json();
+  assert(oobExport.interactions?.[0]?.detail?.body === JSON.stringify({ probe: 'oob' }), 'oob interaction did not export');
+
+  // Disabled listeners stop capturing while still returning the uniform response.
+  const paused = await fetch(`${origin}/api/oob/${probe.id}`, {
+    method: 'PATCH',
+    headers: mutationHeaders,
+    body: JSON.stringify({ enabled: false }),
+  });
+  assert(paused.status === 200, `oob listener pause returned ${paused.status}`);
+  assert((await fetch(`${origin}/o/${probe.token}`, { method: 'POST', headers: { 'Content-Type': 'text/plain' }, body: 'x' })).status === 200, 'paused oob listener leaked state');
+  const afterPaused = await (await fetch(`${origin}/api/oob/interactions?probeId=${probe.id}`, { headers: authHeaders })).json();
+  assert(afterPaused.interactions?.length === 1, 'paused oob listener committed an interaction');
+
+  // Deleting the listener drains its interactions and removes the listener row.
+  let deletedProbe = false;
+  for (let attempt = 0; attempt < 10 && !deletedProbe; attempt += 1) {
+    const payload = await (await fetch(`${origin}/api/oob/${probe.id}`, { method: 'DELETE', headers: mutationHeaders, body: '{}' })).json();
+    deletedProbe = payload.deleted === true;
+  }
+  assert(deletedProbe, 'oob listener was not deleted after draining interactions');
+  assert(
+    (await fetch(`${origin}/api/oob/interactions/${oobInteractionId}`, { headers: authHeaders })).status === 404,
+    'oob interaction survived listener deletion',
+  );
+
   if (process.env.BXSS_TEST_RETENTION === '1') {
-    const wrangler = new URL('../node_modules/wrangler/bin/wrangler.js', import.meta.url);
+    const wrangler = fileURLToPath(new URL('../node_modules/wrangler/bin/wrangler.js', import.meta.url));
     const aged = spawnSync(
       process.execPath,
-      [wrangler.pathname.slice(1), 'd1', 'execute', 'DB', '--local', '--command', `UPDATE events SET received_at = 0 WHERE id = '${eventId}'`],
+      [wrangler, 'd1', 'execute', 'DB', '--local', '--command', `UPDATE events SET received_at = 0 WHERE id = '${eventId}'`],
       { cwd: new URL('..', import.meta.url), encoding: 'utf8', windowsHide: true },
     );
     assert(aged.status === 0, `could not age event for retention test: ${aged.stderr || aged.stdout}`);

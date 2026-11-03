@@ -9,6 +9,13 @@ export interface DiscordCaptureNotice {
   receivedAt: number;
 }
 
+export interface DiscordOobNotice {
+  interactionId: string;
+  probeName: string;
+  method: string;
+  receivedAt: number;
+}
+
 export function validDiscordWebhookUrl(value: string | undefined): string | null {
   if (!value || value.length > 512) return null;
   try {
@@ -65,6 +72,30 @@ export function discordCaptureBody(notice: DiscordCaptureNotice): Record<string,
   };
 }
 
+export function discordOobBody(notice: DiscordOobNotice): Record<string, unknown> {
+  const probeName = plainDiscordText(notice.probeName, 80) || 'Listener';
+  const method = plainDiscordText(notice.method, 16) || 'REQUEST';
+  const timestamp = new Date(notice.receivedAt * 1_000).toISOString();
+  return {
+    username: 'BXSS Vault',
+    allowed_mentions: { parse: [] },
+    embeds: [
+      {
+        title: 'New out-of-band interaction',
+        color: 0x818cf8,
+        fields: [
+          { name: 'Listener', value: probeName, inline: true },
+          { name: 'Method', value: method, inline: true },
+          { name: 'Interaction ID', value: notice.interactionId, inline: false },
+          { name: 'Received', value: timestamp, inline: false },
+        ],
+        footer: { text: 'Metadata only. Open BXSS Vault to view the captured request.' },
+        timestamp,
+      },
+    ],
+  };
+}
+
 async function postDiscordWebhook(webhookUrl: string, body: Record<string, unknown>): Promise<boolean> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), DISCORD_TIMEOUT_MS);
@@ -91,6 +122,12 @@ export async function sendDiscordCaptureNotification(
   const webhookUrl = validDiscordWebhookUrl(env.DISCORD_WEBHOOK_URL);
   if (!webhookUrl) return false;
   return postDiscordWebhook(webhookUrl, discordCaptureBody(notice));
+}
+
+export async function sendDiscordOobNotification(env: Env, notice: DiscordOobNotice): Promise<boolean> {
+  const webhookUrl = validDiscordWebhookUrl(env.DISCORD_WEBHOOK_URL);
+  if (!webhookUrl) return false;
+  return postDiscordWebhook(webhookUrl, discordOobBody(notice));
 }
 
 export async function sendDiscordTestNotification(env: Env, collectorName: string): Promise<boolean> {

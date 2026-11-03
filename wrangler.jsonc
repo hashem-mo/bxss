@@ -52,6 +52,10 @@
 "RP_ID": "bxss-vault.hm0.workers.dev",
 "COLLECTOR_ORIGIN": "https://bxss-vault.hm0.workers.dev",
 		"RP_NAME": "BXSS Vault",
+		// Optional out-of-band wildcard capture host. Path callbacks at
+		// COLLECTOR_ORIGIN/o/<token> always work without this. Set it (and route
+		// its wildcard to this Worker) to also catch <token>.oob.example.com.
+		// "OOB_WILDCARD_HOST": "oob.example.com",
 		"SESSION_IDLE_SECONDS": "900",
 		"SESSION_ABSOLUTE_SECONDS": "14400",
 		"MAX_CAPTURE_BYTES": "20971520",

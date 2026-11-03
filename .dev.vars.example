@@ -10,5 +10,10 @@ BOOTSTRAP_TOKEN=replace-with-32-random-bytes-base64url
 # CF_ACCESS_TEAM_DOMAIN=https://your-team.cloudflareaccess.com
 # CF_ACCESS_AUD=your-access-application-audience-tag
 
+# Optional out-of-band (OOB) wildcard capture host. Path callbacks at
+# COLLECTOR_ORIGIN/o/<token> always work; set this and route *.oob.example.com
+# to the Worker to also capture bare-hostname callbacks like <token>.oob.example.com.
+# OOB_WILDCARD_HOST=oob.example.com
+
 # Optional metadata-only Discord notifications. Never commit a real webhook.
 # DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/WEBHOOK_ID/WEBHOOK_TOKEN

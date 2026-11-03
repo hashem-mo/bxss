@@ -6,6 +6,7 @@ import { createCollectorAlias, isCollectorAlias } from '../lib/collector-identif
 import { keyedHash, openBytes, openJson, sealJson, unpackSealed } from '../lib/crypto';
 import { bytesToBase64Url, fromUtf8, randomId, randomToken, safeJsonParse, utf8 } from '../lib/encoding';
 import { discordWebhookConfigured, sendDiscordTestNotification } from '../lib/discord';
+import { createOobToken, normalizeOobWildcardHost, oobHostLoader, oobPathLoader } from '../lib/oob';
 import {
   collectorOrigin,
   intSetting,
@@ -14,7 +15,15 @@ import {
   requireSameOrigin,
   validateCsrf,
 } from '../lib/http';
-import type { CapturedEvent, CollectorRecord, Env, EventSummary, Variables } from '../types';
+import type {
+  CapturedEvent,
+  CollectorRecord,
+  Env,
+  EventSummary,
+  OobInteractionSummary,
+  OobProbeRecord,
+  Variables,
+} from '../types';
 
 type AdminContext = Context<{ Bindings: Env; Variables: Variables }>;
 
@@ -131,6 +140,49 @@ const collectorUpdateSchema = z
   })
   .strict()
   .refine((value) => Object.keys(value).length > 0, 'At least one collector setting is required.');
+
+const oobProbeCreateSchema = z.object({ name: z.string().trim().min(1).max(80) }).strict();
+const oobProbeUpdateSchema = z
+  .object({
+    name: z.string().trim().min(1).max(80).optional(),
+    enabled: z.boolean().optional(),
+    discordNotifications: z.boolean().optional(),
+  })
+  .strict()
+  .refine((value) => Object.keys(value).length > 0, 'At least one listener setting is required.');
+const oobBulkDeleteSchema = z
+  .object({
+    ids: z.array(z.string().uuid()).min(1).max(20).optional(),
+    all: z.literal(true).optional(),
+    probeId: z.string().uuid().optional(),
+    confirmation: z.string().max(64).optional(),
+  })
+  .strict()
+  .superRefine((value, context) => {
+    if (Boolean(value.ids) === Boolean(value.all)) {
+      context.addIssue({ code: 'custom', message: 'Choose interaction IDs or all interactions.' });
+    }
+    if (value.ids && value.probeId) {
+      context.addIssue({ code: 'custom', message: 'Scope by probe only applies to delete-all.' });
+    }
+    if (value.all && value.confirmation !== 'DELETE OOB INTERACTIONS') {
+      context.addIssue({ code: 'custom', message: 'Delete-all confirmation is required.' });
+    }
+  });
+
+const OOB_DELETE_BATCH = 20;
+
+interface OobInteractionRow {
+  id: string;
+  probe_id: string;
+  probe_name: string;
+  received_at: number;
+  summary_ciphertext: string;
+  summary_iv: string;
+  detail_key: string;
+  detail_bytes: number;
+  is_read: number;
+}
 
 function changes(result: D1Result<unknown>): number {
   return Number(result.meta?.changes ?? 0);
@@ -487,6 +539,14 @@ app.get('/export/events', async (c) => {
         .bind(session.userId)
         .all<CollectorAdminRecord>();
       const publicOrigin = collectorOrigin(c.req.raw, c.env);
+      const oobWildcardHost = normalizeOobWildcardHost(c.env.OOB_WILDCARD_HOST);
+      const oobProbes = await c.env.DB.prepare(
+        `SELECT id, user_id, name, token_hash, token_ciphertext, token_iv,
+                enabled, discord_notifications, created_at, updated_at
+           FROM oob_probes WHERE user_id = ? ORDER BY created_at ASC, id ASC`,
+      )
+        .bind(session.userId)
+        .all<OobProbeRecord>();
       manifest = {
         format: 'bxss-vault-plaintext-v1',
         warning: 'PLAINTEXT EXPORT - encrypt and protect this archive immediately',
@@ -494,6 +554,9 @@ app.get('/export/events', async (c) => {
         user: { id: session.userId, email: session.email, displayName: session.displayName },
         collectors: await Promise.all(
           collectors.results.map((collector) => decryptCollector(c.env, collector, publicOrigin)),
+        ),
+        oobListeners: await Promise.all(
+          oobProbes.results.map((probe) => decryptOobProbe(c.env, probe, publicOrigin, oobWildcardHost)),
         ),
       };
     }
@@ -1331,10 +1394,29 @@ app.get('/stats', async (c) => {
        (SELECT COUNT(*) FROM passkeys WHERE user_id = ?) AS passkey_count,
        (SELECT COUNT(*)
           FROM events e JOIN collectors c ON c.id = e.collector_id
-         WHERE c.user_id = ? AND e.created_day = ?) AS events_today`,
+         WHERE c.user_id = ? AND e.created_day = ?) AS events_today,
+       (SELECT COUNT(*) FROM oob_probes WHERE user_id = ?) AS oob_probe_count,
+       (SELECT COUNT(*)
+          FROM oob_interactions i JOIN oob_probes p ON p.id = i.probe_id
+         WHERE p.user_id = ?) AS oob_interaction_count,
+       (SELECT COUNT(*)
+          FROM oob_interactions i JOIN oob_probes p ON p.id = i.probe_id
+         WHERE p.user_id = ? AND i.is_read = 0) AS oob_unread_count,
+       (SELECT COALESCE(SUM(MAX(0, i.detail_bytes)), 0)
+          FROM oob_interactions i JOIN oob_probes p ON p.id = i.probe_id
+         WHERE p.user_id = ?) AS oob_storage_bytes,
+       (SELECT COUNT(*)
+          FROM oob_interactions i JOIN oob_probes p ON p.id = i.probe_id
+         WHERE p.user_id = ? AND i.created_day = ?) AS oob_today`,
   )
     .bind(
       session.userId,
+      session.userId,
+      session.userId,
+      session.userId,
+      session.userId,
+      session.userId,
+      today,
       session.userId,
       session.userId,
       session.userId,
@@ -1349,20 +1431,596 @@ app.get('/stats', async (c) => {
       collector_count: number;
       passkey_count: number;
       events_today: number;
+      oob_probe_count: number;
+      oob_interaction_count: number;
+      oob_unread_count: number;
+      oob_storage_bytes: number;
+      oob_today: number;
     }>();
 
   return c.json({
     stats: {
       eventCount: Number(stats?.event_count ?? 0),
       unreadCount: Number(stats?.unread_count ?? 0),
-      storageBytes: Number(stats?.storage_bytes ?? 0),
+      storageBytes: Number(stats?.storage_bytes ?? 0) + Number(stats?.oob_storage_bytes ?? 0),
       storageLimitBytes: intSetting(c.env.MAX_STORAGE_BYTES, 8_053_063_680, 1_048_576, 1_000_000_000_000),
       collectorCount: Number(stats?.collector_count ?? 0),
       passkeyCount: Number(stats?.passkey_count ?? 0),
       eventsToday: Number(stats?.events_today ?? 0),
+      oobProbeCount: Number(stats?.oob_probe_count ?? 0),
+      oobInteractionCount: Number(stats?.oob_interaction_count ?? 0),
+      oobUnreadCount: Number(stats?.oob_unread_count ?? 0),
+      oobInteractionsToday: Number(stats?.oob_today ?? 0),
       retentionDays: intSetting(c.env.RETENTION_DAYS, 30, 1, 365),
     },
   });
+});
+
+// --- Out-of-band (OOB) interaction server -----------------------------------
+
+function oobContext(c: AdminContext): { origin: string; wildcardHost: string } {
+  return {
+    origin: collectorOrigin(c.req.raw, c.env),
+    wildcardHost: normalizeOobWildcardHost(c.env.OOB_WILDCARD_HOST),
+  };
+}
+
+async function decryptOobProbe(
+  env: Env,
+  probe: OobProbeRecord,
+  origin: string,
+  wildcardHost: string,
+) {
+  const token = await openJson<string>(env, `oob-probe:${probe.id}:token`, {
+    ciphertext: probe.token_ciphertext,
+    iv: probe.token_iv,
+  });
+  return {
+    id: probe.id,
+    name: probe.name,
+    token,
+    pathLoaderUrl: oobPathLoader(origin, token),
+    hostLoaderUrl: wildcardHost ? `https://${oobHostLoader(wildcardHost, token)}/` : null,
+    wildcardHost: wildcardHost || null,
+    enabled: probe.enabled === 1,
+    discordNotifications: probe.discord_notifications === 1,
+    discordConfigured: discordWebhookConfigured(env),
+    createdAt: Number(probe.created_at),
+    updatedAt: Number(probe.updated_at),
+  };
+}
+
+async function ownedOobProbe(env: Env, userId: string, probeId: string): Promise<OobProbeRecord | null> {
+  return env.DB.prepare(
+    `SELECT id, user_id, name, token_hash, token_ciphertext, token_iv,
+            enabled, discord_notifications, created_at, updated_at
+       FROM oob_probes
+      WHERE id = ? AND user_id = ?`,
+  )
+    .bind(probeId, userId)
+    .first<OobProbeRecord>();
+}
+
+async function ownedOobInteraction(env: Env, userId: string, id: string): Promise<OobInteractionRow | null> {
+  return env.DB.prepare(
+    `SELECT i.id, i.probe_id, p.name AS probe_name, i.received_at,
+            i.summary_ciphertext, i.summary_iv, i.detail_key, i.detail_bytes, i.is_read
+       FROM oob_interactions i
+       JOIN oob_probes p ON p.id = i.probe_id
+      WHERE i.id = ? AND p.user_id = ?`,
+  )
+    .bind(id, userId)
+    .first<OobInteractionRow>();
+}
+
+async function decryptOobSummary(env: Env, row: OobInteractionRow): Promise<OobInteractionSummary | null> {
+  try {
+    return await openJson<OobInteractionSummary>(env, `oob:${row.id}:summary`, {
+      ciphertext: row.summary_ciphertext,
+      iv: row.summary_iv,
+    });
+  } catch {
+    return null;
+  }
+}
+
+function publicOobInteraction(row: OobInteractionRow, summary: OobInteractionSummary | null) {
+  return {
+    id: row.id,
+    probeId: row.probe_id,
+    probeName: row.probe_name,
+    receivedAt: Number(row.received_at),
+    isRead: row.is_read === 1,
+    detailBytes: Number(row.detail_bytes),
+    summary,
+  };
+}
+
+app.post('/oob', async (c) => {
+  const rejected = await mutationChecks(c, true);
+  if (rejected) return rejected;
+  const body = oobProbeCreateSchema.safeParse(await parseJson(c.req.raw));
+  if (!body.success) return jsonError(c, 422, 'invalid_input', 'A listener name is required.');
+  const session = c.get('session');
+  const existing = await c.env.DB.prepare('SELECT COUNT(*) AS count FROM oob_probes WHERE user_id = ?')
+    .bind(session.userId)
+    .first<{ count: number }>();
+  if (Number(existing?.count ?? 0) >= 100) {
+    return jsonError(c, 409, 'oob_limit', 'This vault already has the maximum of 100 OOB listeners.');
+  }
+
+  const id = randomId();
+  const token = createOobToken();
+  const createdAt = currentTime();
+  const sealed = await sealJson(c.env, `oob-probe:${id}:token`, token);
+  const result = await c.env.DB.prepare(
+    `INSERT INTO oob_probes
+      (id, user_id, name, token_hash, token_ciphertext, token_iv, created_at, updated_at)
+     SELECT ?, id, ?, ?, ?, ?, ?, ?
+       FROM users
+      WHERE id = ? AND enabled = 1
+        AND (SELECT COUNT(*) FROM oob_probes WHERE user_id = ?) < 100`,
+  )
+    .bind(
+      id,
+      body.data.name,
+      await keyedHash(c.env, 'oob-token', token),
+      sealed.ciphertext,
+      sealed.iv,
+      createdAt,
+      createdAt,
+      session.userId,
+      session.userId,
+    )
+    .run();
+  if (changes(result) !== 1) {
+    return jsonError(c, 409, 'oob_limit', 'This vault already has the maximum of 100 OOB listeners.');
+  }
+
+  await audit(c.req.raw, c.env, {
+    userId: session.userId,
+    action: 'oob_probe.create',
+    targetType: 'oob_probe',
+    targetId: id,
+  }).catch(() => undefined);
+  const probe = await ownedOobProbe(c.env, session.userId, id);
+  if (!probe) return jsonError(c, 500, 'oob_create_failed', 'The listener could not be loaded.');
+  const { origin, wildcardHost } = oobContext(c);
+  return c.json({ probe: await decryptOobProbe(c.env, probe, origin, wildcardHost) }, 201);
+});
+
+app.get('/oob', async (c) => {
+  const stepUp = await requireStepUp(c);
+  if (stepUp) return stepUp;
+  const session = c.get('session');
+  const result = await c.env.DB.prepare(
+    `SELECT id, user_id, name, token_hash, token_ciphertext, token_iv,
+            enabled, discord_notifications, created_at, updated_at
+       FROM oob_probes
+      WHERE user_id = ?
+      ORDER BY created_at ASC, id ASC`,
+  )
+    .bind(session.userId)
+    .all<OobProbeRecord>();
+  try {
+    const { origin, wildcardHost } = oobContext(c);
+    return c.json({
+      probes: await Promise.all(result.results.map((probe) => decryptOobProbe(c.env, probe, origin, wildcardHost))),
+    });
+  } catch {
+    return jsonError(c, 500, 'oob_token_invalid', 'A listener token could not be authenticated.');
+  }
+});
+
+app.get('/oob/interactions', async (c) => {
+  const session = c.get('session');
+  const limit = listLimit(c.req.query('limit'));
+  if (!limit) return jsonError(c, 422, 'invalid_pagination', 'Invalid pagination parameters.');
+  const requestedCursor = c.req.query('cursor');
+  const cursor = requestedCursor ? decodeCursor(requestedCursor, 'string') : null;
+  if (requestedCursor && !cursor) return jsonError(c, 422, 'invalid_cursor', 'Invalid pagination cursor.');
+  const probeId = c.req.query('probeId')?.trim() || null;
+  if (probeId && probeId.length > 128) return jsonError(c, 422, 'invalid_probe', 'Invalid listener filter.');
+
+  const result = await c.env.DB.prepare(
+    `SELECT i.id, i.probe_id, p.name AS probe_name, i.received_at,
+            i.summary_ciphertext, i.summary_iv, i.detail_key, i.detail_bytes, i.is_read
+       FROM oob_interactions i
+       JOIN oob_probes p ON p.id = i.probe_id
+      WHERE p.user_id = ?
+        AND (? IS NULL OR i.probe_id = ?)
+        AND (? IS NULL OR i.received_at < ? OR (i.received_at = ? AND i.id < ?))
+      ORDER BY i.received_at DESC, i.id DESC
+      LIMIT ?`,
+  )
+    .bind(
+      session.userId,
+      probeId,
+      probeId,
+      cursor?.timestamp ?? null,
+      cursor?.timestamp ?? null,
+      cursor?.timestamp ?? null,
+      cursor?.id ?? null,
+      limit + 1,
+    )
+    .all<OobInteractionRow>();
+
+  const page = result.results.slice(0, limit);
+  const interactions = await Promise.all(
+    page.map(async (row) => publicOobInteraction(row, await decryptOobSummary(c.env, row))),
+  );
+  const last = page.at(-1);
+  const nextCursor = result.results.length > limit && last
+    ? encodeCursor({ timestamp: Number(last.received_at), id: last.id })
+    : null;
+  return c.json({ interactions, nextCursor });
+});
+
+app.get('/export/oob', async (c) => {
+  const stepUp = await requireStepUp(c);
+  if (stepUp) return stepUp;
+  const session = c.get('session');
+  const requestedCursor = c.req.query('cursor');
+  const cursor = requestedCursor ? decodeCursor(requestedCursor, 'string') : null;
+  if (requestedCursor && !cursor) return jsonError(c, 422, 'invalid_cursor', 'Invalid export cursor.');
+  const batchSize = 10;
+  const result = await c.env.DB.prepare(
+    `SELECT i.id, i.probe_id, p.name AS probe_name, i.received_at,
+            i.summary_ciphertext, i.summary_iv, i.detail_key, i.detail_bytes, i.is_read
+       FROM oob_interactions i
+       JOIN oob_probes p ON p.id = i.probe_id
+      WHERE p.user_id = ?
+        AND (? IS NULL OR i.received_at < ? OR (i.received_at = ? AND i.id < ?))
+      ORDER BY i.received_at DESC, i.id DESC
+      LIMIT ?`,
+  )
+    .bind(
+      session.userId,
+      cursor?.timestamp ?? null,
+      cursor?.timestamp ?? null,
+      cursor?.timestamp ?? null,
+      cursor?.id ?? null,
+      batchSize + 1,
+    )
+    .all<OobInteractionRow>();
+  try {
+    const page = result.results.slice(0, batchSize);
+    const interactions = await Promise.all(
+      page.map(async (row) => {
+        const object = await c.env.VAULT.get(row.detail_key);
+        if (!object) throw new Error('Missing interaction detail');
+        const detail = await openJson<unknown>(
+          c.env,
+          `oob:${row.id}:detail`,
+          unpackSealed(await object.arrayBuffer()),
+        );
+        const summary = await decryptOobSummary(c.env, row);
+        if (!summary) throw new Error('Invalid interaction summary');
+        return { ...publicOobInteraction(row, summary), detail };
+      }),
+    );
+    const last = page.at(-1);
+    const nextCursor = result.results.length > batchSize && last
+      ? encodeCursor({ timestamp: Number(last.received_at), id: last.id })
+      : null;
+    await audit(c.req.raw, c.env, {
+      userId: session.userId,
+      action: 'vault.export.oob',
+      targetType: 'oob_interaction',
+      metadata: { count: interactions.length },
+    });
+    return c.json({ interactions, nextCursor });
+  } catch {
+    return jsonError(c, 500, 'export_failed', 'An out-of-band interaction could not be authenticated for export.');
+  }
+});
+
+app.get('/oob/interactions/:id', async (c) => {
+  const stepUp = await requireStepUp(c);
+  if (stepUp) return stepUp;
+  const session = c.get('session');
+  const interaction = await ownedOobInteraction(c.env, session.userId, c.req.param('id'));
+  if (!interaction) return jsonError(c, 404, 'interaction_not_found', 'Interaction not found.');
+
+  const object = await c.env.VAULT.get(interaction.detail_key);
+  if (!object) return jsonError(c, 404, 'interaction_data_missing', 'Interaction data is unavailable.');
+  let detail: unknown;
+  try {
+    detail = await openJson<unknown>(
+      c.env,
+      `oob:${interaction.id}:detail`,
+      unpackSealed(await object.arrayBuffer()),
+    );
+  } catch {
+    await audit(c.req.raw, c.env, {
+      userId: session.userId,
+      action: 'oob_interaction.view',
+      targetType: 'oob_interaction',
+      targetId: interaction.id,
+      result: 'error',
+    }).catch(() => undefined);
+    return jsonError(c, 500, 'interaction_data_invalid', 'Interaction data could not be authenticated.');
+  }
+
+  const summary = await decryptOobSummary(c.env, interaction);
+  await audit(c.req.raw, c.env, {
+    userId: session.userId,
+    action: 'oob_interaction.view',
+    targetType: 'oob_interaction',
+    targetId: interaction.id,
+  }).catch(() => undefined);
+  return c.json({ interaction: { ...publicOobInteraction(interaction, summary), detail } });
+});
+
+app.post('/oob/interactions/:id/read', async (c) => {
+  const rejected = await mutationChecks(c, false);
+  if (rejected) return rejected;
+  const body = readEventSchema.safeParse(await parseJson(c.req.raw));
+  if (!body.success) return jsonError(c, 422, 'invalid_input', 'Invalid read state.');
+  const session = c.get('session');
+  const result = await c.env.DB.prepare(
+    `UPDATE oob_interactions
+        SET is_read = ?
+      WHERE id = ?
+        AND probe_id IN (SELECT id FROM oob_probes WHERE user_id = ?)`,
+  )
+    .bind(body.data.read ? 1 : 0, c.req.param('id'), session.userId)
+    .run();
+  if (changes(result) !== 1) return jsonError(c, 404, 'interaction_not_found', 'Interaction not found.');
+  return c.json({ ok: true, isRead: body.data.read });
+});
+
+app.delete('/oob/interactions', async (c) => {
+  const rejected = await mutationChecks(c, true);
+  if (rejected) return rejected;
+  const parsed = oobBulkDeleteSchema.safeParse(await parseJson(c.req.raw));
+  if (!parsed.success) return jsonError(c, 422, 'invalid_input', 'Invalid bulk-delete request.');
+  const session = c.get('session');
+  const ids = parsed.data.ids ?? [];
+  const probeId = parsed.data.probeId ?? null;
+  const placeholders = ids.map(() => '?').join(', ');
+  const query = parsed.data.all
+    ? `SELECT i.id, i.detail_key, i.detail_bytes
+         FROM oob_interactions i JOIN oob_probes p ON p.id = i.probe_id
+        WHERE p.user_id = ? AND (? IS NULL OR i.probe_id = ?)
+        ORDER BY i.received_at ASC, i.id ASC LIMIT ${OOB_DELETE_BATCH}`
+    : `SELECT i.id, i.detail_key, i.detail_bytes
+         FROM oob_interactions i JOIN oob_probes p ON p.id = i.probe_id
+        WHERE p.user_id = ? AND i.id IN (${placeholders})`;
+  const selected = await (parsed.data.all
+    ? c.env.DB.prepare(query).bind(session.userId, probeId, probeId)
+    : c.env.DB.prepare(query).bind(session.userId, ...ids)
+  ).all<{ id: string; detail_key: string; detail_bytes: number }>();
+
+  if (selected.results.length === 0) return c.json({ ok: true, deletedIds: [], remaining: false });
+  try {
+    await c.env.VAULT.delete(selected.results.map((interaction) => interaction.detail_key));
+  } catch {
+    return jsonError(c, 500, 'storage_delete_failed', 'Encrypted interaction objects could not be deleted.');
+  }
+
+  const now = currentTime();
+  const statements: D1PreparedStatement[] = [];
+  for (const interaction of selected.results) {
+    const bytes = Math.max(0, Number(interaction.detail_bytes));
+    statements.push(
+      c.env.DB.prepare(
+        `DELETE FROM oob_interactions
+          WHERE id = ? AND probe_id IN (SELECT id FROM oob_probes WHERE user_id = ?)`,
+      ).bind(interaction.id, session.userId),
+      c.env.DB.prepare(
+        `UPDATE app_state
+            SET storage_bytes = MAX(0, storage_bytes - (? * changes())), updated_at = ?
+          WHERE id = 1`,
+      ).bind(bytes, now),
+    );
+  }
+  const results = await c.env.DB.batch(statements);
+  const deletedIds = selected.results
+    .filter((_, index) => changes(results[index * 2]) === 1)
+    .map((interaction) => interaction.id);
+  const remaining = parsed.data.all
+    ? Boolean(
+        await c.env.DB.prepare(
+          `SELECT 1 AS present FROM oob_interactions i JOIN oob_probes p ON p.id = i.probe_id
+            WHERE p.user_id = ? AND (? IS NULL OR i.probe_id = ?) LIMIT 1`,
+        )
+          .bind(session.userId, probeId, probeId)
+          .first<{ present: number }>(),
+      )
+    : false;
+  await audit(c.req.raw, c.env, {
+    userId: session.userId,
+    action: parsed.data.all ? 'oob_interaction.delete_all.batch' : 'oob_interaction.delete_bulk',
+    targetType: 'oob_interaction',
+    metadata: { count: deletedIds.length },
+  }).catch(() => undefined);
+  return c.json({ ok: true, deletedIds, remaining });
+});
+
+app.delete('/oob/interactions/:id', async (c) => {
+  const rejected = await mutationChecks(c, true);
+  if (rejected) return rejected;
+  const body = emptyBodySchema.safeParse(await parseJson(c.req.raw));
+  if (!body.success) return jsonError(c, 422, 'invalid_input', 'An empty JSON object is required.');
+  const session = c.get('session');
+  const interaction = await ownedOobInteraction(c.env, session.userId, c.req.param('id'));
+  if (!interaction) return jsonError(c, 404, 'interaction_not_found', 'Interaction not found.');
+
+  try {
+    await c.env.VAULT.delete(interaction.detail_key);
+  } catch {
+    return jsonError(c, 500, 'storage_delete_failed', 'Encrypted interaction objects could not be deleted.');
+  }
+  const bytes = Math.max(0, Number(interaction.detail_bytes));
+  const results = await c.env.DB.batch([
+    c.env.DB.prepare(
+      `DELETE FROM oob_interactions
+        WHERE id = ? AND probe_id IN (SELECT id FROM oob_probes WHERE user_id = ?)`,
+    ).bind(interaction.id, session.userId),
+    c.env.DB.prepare(
+      `UPDATE app_state
+          SET storage_bytes = MAX(0, storage_bytes - (? * changes())), updated_at = ?
+        WHERE id = 1 AND EXISTS (SELECT 1 FROM users WHERE id = ?)`,
+    ).bind(bytes, currentTime(), session.userId),
+  ]);
+  if (changes(results[0]) !== 1) return jsonError(c, 404, 'interaction_not_found', 'Interaction not found.');
+
+  await audit(c.req.raw, c.env, {
+    userId: session.userId,
+    action: 'oob_interaction.delete',
+    targetType: 'oob_interaction',
+    targetId: interaction.id,
+    metadata: { bytes },
+  }).catch(() => undefined);
+  return c.json({ ok: true });
+});
+
+app.patch('/oob/:id', async (c) => {
+  const rejected = await mutationChecks(c, true);
+  if (rejected) return rejected;
+  const body = oobProbeUpdateSchema.safeParse(await parseJson(c.req.raw));
+  if (!body.success) return jsonError(c, 422, 'invalid_input', 'Invalid listener settings.');
+  if (body.data.discordNotifications === true && !discordWebhookConfigured(c.env)) {
+    return jsonError(c, 409, 'discord_not_configured', 'Configure the Discord webhook secret before enabling notifications.');
+  }
+  const session = c.get('session');
+  const probe = await ownedOobProbe(c.env, session.userId, c.req.param('id'));
+  if (!probe) return jsonError(c, 404, 'oob_not_found', 'Listener not found.');
+
+  const updated = {
+    name: body.data.name ?? probe.name,
+    enabled: body.data.enabled ?? probe.enabled === 1,
+    discordNotifications: body.data.discordNotifications ?? probe.discord_notifications === 1,
+  };
+  const result = await c.env.DB.prepare(
+    `UPDATE oob_probes
+        SET name = ?, enabled = ?, discord_notifications = ?, updated_at = ?
+      WHERE id = ? AND user_id = ?`,
+  )
+    .bind(
+      updated.name,
+      updated.enabled ? 1 : 0,
+      updated.discordNotifications ? 1 : 0,
+      currentTime(),
+      probe.id,
+      session.userId,
+    )
+    .run();
+  if (changes(result) !== 1) return jsonError(c, 404, 'oob_not_found', 'Listener not found.');
+
+  await audit(c.req.raw, c.env, {
+    userId: session.userId,
+    action: 'oob_probe.update',
+    targetType: 'oob_probe',
+    targetId: probe.id,
+  }).catch(() => undefined);
+  const refreshed = await ownedOobProbe(c.env, session.userId, probe.id);
+  if (!refreshed) return jsonError(c, 404, 'oob_not_found', 'Listener not found.');
+  try {
+    const { origin, wildcardHost } = oobContext(c);
+    return c.json({ ok: true, probe: await decryptOobProbe(c.env, refreshed, origin, wildcardHost) });
+  } catch {
+    return jsonError(c, 500, 'oob_token_invalid', 'The listener token could not be authenticated.');
+  }
+});
+
+app.post('/oob/:id/rotate', async (c) => {
+  const rejected = await mutationChecks(c, true);
+  if (rejected) return rejected;
+  const body = emptyBodySchema.safeParse(await parseJson(c.req.raw));
+  if (!body.success) return jsonError(c, 422, 'invalid_input', 'An empty JSON object is required.');
+  const session = c.get('session');
+  const probeId = c.req.param('id');
+  const token = createOobToken();
+  const sealed = await sealJson(c.env, `oob-probe:${probeId}:token`, token);
+  const result = await c.env.DB.prepare(
+    `UPDATE oob_probes
+        SET token_hash = ?, token_ciphertext = ?, token_iv = ?, updated_at = ?
+      WHERE id = ? AND user_id = ?`,
+  )
+    .bind(
+      await keyedHash(c.env, 'oob-token', token),
+      sealed.ciphertext,
+      sealed.iv,
+      currentTime(),
+      probeId,
+      session.userId,
+    )
+    .run();
+  if (changes(result) !== 1) return jsonError(c, 404, 'oob_not_found', 'Listener not found.');
+
+  await audit(c.req.raw, c.env, {
+    userId: session.userId,
+    action: 'oob_probe.token.rotate',
+    targetType: 'oob_probe',
+    targetId: probeId,
+  }).catch(() => undefined);
+  const { origin, wildcardHost } = oobContext(c);
+  return c.json({
+    ok: true,
+    token,
+    pathLoaderUrl: oobPathLoader(origin, token),
+    hostLoaderUrl: wildcardHost ? `https://${oobHostLoader(wildcardHost, token)}/` : null,
+  });
+});
+
+app.delete('/oob/:id', async (c) => {
+  const rejected = await mutationChecks(c, true);
+  if (rejected) return rejected;
+  const body = emptyBodySchema.safeParse(await parseJson(c.req.raw));
+  if (!body.success) return jsonError(c, 422, 'invalid_input', 'An empty JSON object is required.');
+  const session = c.get('session');
+  const probeId = c.req.param('id');
+  const probe = await ownedOobProbe(c.env, session.userId, probeId);
+  if (!probe) return jsonError(c, 404, 'oob_not_found', 'Listener not found.');
+
+  // Drain the listener's encrypted interactions in bounded batches before
+  // removing the listener row, so neither R2 nor D1 exceeds per-request limits.
+  const selected = await c.env.DB.prepare(
+    `SELECT id, detail_key, detail_bytes
+       FROM oob_interactions
+      WHERE probe_id = ?
+      ORDER BY received_at ASC, id ASC
+      LIMIT ${OOB_DELETE_BATCH}`,
+  )
+    .bind(probe.id)
+    .all<{ id: string; detail_key: string; detail_bytes: number }>();
+
+  if (selected.results.length > 0) {
+    try {
+      await c.env.VAULT.delete(selected.results.map((interaction) => interaction.detail_key));
+    } catch {
+      return jsonError(c, 500, 'storage_delete_failed', 'Encrypted interaction objects could not be deleted.');
+    }
+    const now = currentTime();
+    const statements: D1PreparedStatement[] = [];
+    for (const interaction of selected.results) {
+      const bytes = Math.max(0, Number(interaction.detail_bytes));
+      statements.push(
+        c.env.DB.prepare('DELETE FROM oob_interactions WHERE id = ? AND probe_id = ?').bind(interaction.id, probe.id),
+        c.env.DB.prepare(
+          `UPDATE app_state
+              SET storage_bytes = MAX(0, storage_bytes - (? * changes())), updated_at = ?
+            WHERE id = 1`,
+        ).bind(bytes, now),
+      );
+    }
+    await c.env.DB.batch(statements);
+    return c.json({ ok: true, deleted: false, remaining: true });
+  }
+
+  const deletion = await c.env.DB.prepare('DELETE FROM oob_probes WHERE id = ? AND user_id = ?')
+    .bind(probe.id, session.userId)
+    .run();
+  if (changes(deletion) !== 1) return jsonError(c, 404, 'oob_not_found', 'Listener not found.');
+  await audit(c.req.raw, c.env, {
+    userId: session.userId,
+    action: 'oob_probe.delete',
+    targetType: 'oob_probe',
+    targetId: probe.id,
+  }).catch(() => undefined);
+  return c.json({ ok: true, deleted: true, remaining: false });
 });
 
 export default app;

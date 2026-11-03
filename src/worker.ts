@@ -4,14 +4,16 @@ import type { Env, Variables } from './types';
 import { resolveSession, sessionCookieCleared } from './lib/auth';
 import { jsonError, securityHeaders } from './lib/http';
 import { runRetention } from './lib/retention';
+import { normalizeOobWildcardHost, oobTokenFromHost } from './lib/oob';
 import authRoutes from './routes/auth';
 import adminRoutes from './routes/admin';
 import collectorRoutes from './routes/collector';
+import oobRoutes, { captureOob } from './routes/oob';
 
 const app = new Hono<{ Bindings: Env; Variables: Variables }>();
 const accessKeySets = new Map<string, ReturnType<typeof createRemoteJWKSet>>();
 
-const PUBLIC_PREFIXES = ['/p/', '/a/', '/c/', '/probe-runtime/'];
+const PUBLIC_PREFIXES = ['/p/', '/a/', '/c/', '/o/', '/probe-runtime/'];
 const PUBLIC_EXACT = new Set(['/health', '/ingest/injections']);
 const DASHBOARD_EXACT = new Set(['/dashboard', '/dashboard/']);
 const LOGIN_ASSET_PREFIX = '/login-assets/';
@@ -65,9 +67,21 @@ async function validateCloudflareAccess(request: Request, env: Env): Promise<boo
 }
 
 app.use('*', async (c, next) => {
-  const path = new URL(c.req.url).pathname;
-  const publicCollector = isCollectorPath(path);
+  const url = new URL(c.req.url);
+  const path = url.pathname;
   c.set('requestId', c.req.header('CF-Ray') ?? crypto.randomUUID());
+
+  // Subdomain-based out-of-band capture: `<token>.<OOB_WILDCARD_HOST>` accepts a
+  // callback on any path and must bypass the console's Cloudflare Access and
+  // authentication gates exactly like the path-based collector endpoints.
+  const wildcardHost = normalizeOobWildcardHost(c.env.OOB_WILDCARD_HOST);
+  const hostToken = wildcardHost ? oobTokenFromHost(url.hostname, wildcardHost) : null;
+  if (hostToken) {
+    c.res = securityHeaders(await captureOob(c.req.raw, c.env, c.executionCtx, hostToken, 'host'), false);
+    return;
+  }
+
+  const publicCollector = isCollectorPath(path);
 
   if (!publicCollector && !(await validateCloudflareAccess(c.req.raw, c.env))) {
     c.res = jsonError(c, 403, 'access_denied', 'Cloudflare Access verification failed.');
@@ -125,6 +139,7 @@ app.get('/admin-assets/*', (c) => c.env.ASSETS.fetch(c.req.raw));
 app.get('/probe-runtime.js', (c) => jsonError(c, 404, 'not_found', 'Not found.'));
 
 app.route('/', collectorRoutes);
+app.route('/', oobRoutes);
 app.route('/api/auth', authRoutes);
 app.route('/api', adminRoutes);
 

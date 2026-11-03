@@ -5,7 +5,7 @@ import { createPayloadSnippets } from './payload-snippets';
 import './styles.css';
 
 type JsonMap = Record<string, unknown>;
-type View = 'events' | 'collectors' | 'security' | 'audit';
+type View = 'events' | 'collectors' | 'oob' | 'security' | 'audit';
 type Notice = { id: number; tone: 'success' | 'danger' | 'info'; message: string };
 
 interface SessionUser {
@@ -61,6 +61,30 @@ interface Collector {
   chainloadUrl: string;
   createdAt: number;
   updatedAt: number;
+}
+
+interface OobProbe {
+  id: string;
+  name: string;
+  token: string;
+  pathLoaderUrl: string;
+  hostLoaderUrl: string;
+  wildcardHost: string;
+  enabled: boolean;
+  discordNotifications: boolean;
+  discordConfigured: boolean;
+  createdAt: number;
+  updatedAt: number;
+}
+
+interface OobInteraction {
+  id: string;
+  probeId: string;
+  probeName: string;
+  receivedAt: number;
+  isRead: boolean;
+  detailBytes: number;
+  summary: JsonMap;
 }
 
 interface Passkey {
@@ -342,6 +366,7 @@ type IconName =
   | 'events'
   | 'eye'
   | 'eyeOff'
+  | 'globe'
   | 'key'
   | 'lock'
   | 'logout'
@@ -376,6 +401,7 @@ function Icon({ name, size = 18 }: { name: IconName; size?: number }) {
     events: <><path d="M4 17V7a2 2 0 0 1 2-2h12a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2Z" /><path d="M8 12h2l1.5-3 2.5 6 1.5-3H18" /></>,
     eye: <><path d="M2 12s3.5-6 10-6 10 6 10 6-3.5 6-10 6S2 12 2 12Z" /><circle cx="12" cy="12" r="2.5" /></>,
     eyeOff: <><path d="m3 3 18 18M10.6 10.7a2 2 0 0 0 2.7 2.7M9.9 5.2A11 11 0 0 1 12 5c6.5 0 10 7 10 7a16 16 0 0 1-2.2 3M6.6 6.7C3.6 8.4 2 12 2 12s3.5 7 10 7a10 10 0 0 0 4-.8" /></>,
+    globe: <><circle cx="12" cy="12" r="9" /><path d="M3 12h18" /><path d="M12 3a15 15 0 0 1 0 18a15 15 0 0 1 0-18" /></>,
     key: <><circle cx="8" cy="15" r="4" /><path d="m11 12 8-8M15 8l3 3M17 6l2 2" /></>,
     lock: <><rect x="4" y="10" width="16" height="11" rx="2" /><path d="M8 10V7a4 4 0 0 1 8 0v3" /></>,
     logout: <><path d="M10 17l5-5-5-5M15 12H3" /><path d="M14 4h4a3 3 0 0 1 3 3v10a3 3 0 0 1-3 3h-4" /></>,
@@ -845,6 +871,36 @@ function normalizeCollector(value: unknown): Collector {
   };
 }
 
+function normalizeOobProbe(value: unknown): OobProbe {
+  const row = asMap(value);
+  return {
+    id: stringValue(row.id),
+    name: stringValue(row.name, 'Listener'),
+    token: stringValue(row.token),
+    pathLoaderUrl: stringValue(row.pathLoaderUrl || row.path_loader_url),
+    hostLoaderUrl: stringValue(row.hostLoaderUrl || row.host_loader_url),
+    wildcardHost: stringValue(row.wildcardHost || row.wildcard_host),
+    enabled: booleanValue(row.enabled, true),
+    discordNotifications: booleanValue(row.discordNotifications ?? row.discord_notifications),
+    discordConfigured: booleanValue(row.discordConfigured ?? row.discord_configured),
+    createdAt: numberValue(row.createdAt || row.created_at),
+    updatedAt: numberValue(row.updatedAt || row.updated_at),
+  };
+}
+
+function normalizeOobInteraction(value: unknown): OobInteraction {
+  const row = asMap(value);
+  return {
+    id: stringValue(row.id),
+    probeId: stringValue(row.probeId || row.probe_id),
+    probeName: stringValue(row.probeName || row.probe_name, 'Listener'),
+    receivedAt: numberValue(row.receivedAt || row.received_at),
+    isRead: booleanValue(row.isRead ?? row.is_read),
+    detailBytes: numberValue(row.detailBytes || row.detail_bytes),
+    summary: asMap(row.summary),
+  };
+}
+
 function normalizePasskey(value: unknown): Passkey {
   const row = asMap(value);
   const last = row.lastUsedAt ?? row.last_used_at;
@@ -1265,6 +1321,21 @@ function EventsPage({ notify }: { notify: (tone: Notice['tone'], message: string
         injectionCursor = stringValue(payload.nextCursor || payload.next_cursor);
       } while (injectionCursor);
 
+      let oobCursor = '';
+      let oobCount = 0;
+      do {
+        const query = oobCursor ? `?cursor=${encodeURIComponent(oobCursor)}` : '';
+        const payload = asMap(await apiJson(API + '/export/oob' + query));
+        for (const raw of asList(payload.interactions)) {
+          const exported = asMap(raw);
+          const id = stringValue(exported.id);
+          if (!/^[0-9a-f-]{36}$/i.test(id)) throw new Error('Export returned an invalid interaction ID.');
+          await writeTarEntry(writer, `oob/${id}/interaction.json`, jsonBytes(exported));
+          oobCount += 1;
+        }
+        oobCursor = stringValue(payload.nextCursor || payload.next_cursor);
+      } while (oobCursor);
+
       let auditCursor = '';
       let auditPage = 0;
       do {
@@ -1282,7 +1353,7 @@ function EventsPage({ notify }: { notify: (tone: Notice['tone'], message: string
       await writeTarEntry(
         writer,
         'export-complete.json',
-        jsonBytes({ eventCount, injectionPages: injectionPage, auditPages: auditPage, completedAt: Date.now() }),
+        jsonBytes({ eventCount, oobCount, injectionPages: injectionPage, auditPages: auditPage, completedAt: Date.now() }),
       );
       await writer.write(new Uint8Array(1_024));
       await writer.close();
@@ -2145,9 +2216,577 @@ function AuditPage() {
   );
 }
 
+function oobInteractionHeadline(interaction: OobInteraction): string {
+  const method = stringValue(interaction.summary.method, 'REQUEST');
+  const path = stringValue(interaction.summary.path, '/');
+  return `${method} ${path}`.trim();
+}
+
+function OobInteractionDrawer({
+  interaction,
+  onClose,
+  onDeleted,
+  onRead,
+}: {
+  interaction: OobInteraction;
+  onClose: () => void;
+  onDeleted: (id: string) => void;
+  onRead: (id: string) => void;
+}) {
+  const [payload, setPayload] = useState<JsonMap | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState('');
+  const [confirmDelete, setConfirmDelete] = useState(false);
+  const [deleting, setDeleting] = useState(false);
+
+  useEffect(() => {
+    let alive = true;
+    const controller = new AbortController();
+    setLoading(true);
+    setError('');
+    apiJson(API + '/oob/interactions/' + encodeURIComponent(interaction.id), { signal: controller.signal })
+      .then((result) => {
+        if (!alive) return;
+        const map = asMap(result);
+        setPayload(asMap(map.interaction || map));
+        setLoading(false);
+        if (!interaction.isRead) {
+          apiJson(API + '/oob/interactions/' + encodeURIComponent(interaction.id) + '/read', {
+            method: 'POST',
+            body: { read: true },
+          }).then(() => onRead(interaction.id)).catch(() => undefined);
+        }
+      })
+      .catch((caught) => {
+        if (alive) {
+          setError(friendlyError(caught));
+          setLoading(false);
+        }
+      });
+    return () => {
+      alive = false;
+      controller.abort();
+    };
+  }, [interaction.id, interaction.isRead, onRead]);
+
+  async function remove() {
+    setDeleting(true);
+    setError('');
+    try {
+      await apiJson(API + '/oob/interactions/' + encodeURIComponent(interaction.id), { method: 'DELETE', body: {} });
+      onDeleted(interaction.id);
+      onClose();
+    } catch (caught) {
+      setError(friendlyError(caught));
+      setDeleting(false);
+    }
+  }
+
+  const full = payload || {};
+  const summary = asMap(full.summary || interaction.summary);
+  const detail = asMap(full.detail);
+  const network = asMap(detail.network);
+  const headers = asList(detail.headers)
+    .map((item) => asMap(item))
+    .map((item) => `${stringValue(item.name)}: ${stringValue(item.value)}`)
+    .join('\n');
+  const bodyEncoding = stringValue(detail.bodyEncoding, 'utf-8');
+  const bodyTruncated = booleanValue(detail.bodyTruncated);
+  const blocks = [
+    { title: 'Request', value: {
+      method: detail.method ?? summary.method,
+      host: detail.host ?? summary.host,
+      path: detail.path ?? summary.path,
+      query: detail.query ?? summary.query,
+      matchedBy: detail.matchedBy ?? summary.matchedBy,
+    } },
+    { title: 'Network', value: {
+      ip: network.ip ?? summary.ip,
+      country: network.country ?? summary.country,
+      city: network.city,
+      colo: network.colo,
+      asn: network.asn,
+      tlsVersion: network.tlsVersion,
+      userAgent: summary.userAgent,
+    } },
+    { title: 'Request headers', value: headers },
+    {
+      title: `Request body${bodyEncoding === 'base64url' ? ' (base64url)' : ''}${bodyTruncated ? ' · truncated' : ''}`,
+      value: detail.body,
+    },
+  ].filter((block) => hasContent(block.value) && (!(typeof block.value === 'object') || Object.values(block.value as object).some(hasContent)));
+
+  return (
+    <div className="drawer-backdrop" role="presentation" onMouseDown={(e) => {
+      if (e.currentTarget === e.target) onClose();
+    }}>
+      <aside className="event-drawer" role="dialog" aria-modal="true" aria-label="Interaction details">
+        <header className="drawer-header">
+          <div>
+            <span className="eyebrow">Out-of-band interaction</span>
+            <h2>{oobInteractionHeadline(interaction)}</h2>
+            <p>{formatDate(interaction.receivedAt)} · {interaction.probeName}</p>
+          </div>
+          <button className="icon-button" type="button" onClick={onClose} aria-label="Close details"><Icon name="close" /></button>
+        </header>
+        {error && <ErrorBanner message={error} onDismiss={() => setError('')} />}
+        {loading ? (
+          <div className="drawer-loading"><Spinner /><span>Decrypting interaction…</span></div>
+        ) : (
+          <div className="drawer-body">
+            <div className="capture-warning">
+              <Icon name="shield" size={17} />
+              The captured request is rendered as inert text. Nothing from it is ever executed.
+            </div>
+            {blocks.map((block) => (
+              <section className="detail-section" key={block.title}>
+                <h3>{block.title}</h3>
+                <pre className="capture-pre">{pretty(block.value)}</pre>
+              </section>
+            ))}
+            <section className="detail-section record-section">
+              <h3>Record</h3>
+              <pre className="capture-pre">{pretty({
+                interactionId: interaction.id,
+                probeId: interaction.probeId,
+                receivedAt: interaction.receivedAt,
+                detailBytes: interaction.detailBytes,
+              })}</pre>
+            </section>
+          </div>
+        )}
+        <footer className="drawer-footer">
+          {confirmDelete ? (
+            <div className="delete-confirm">
+              <span>Delete this interaction permanently?</span>
+              <button className="button button-danger button-small" type="button" onClick={remove} disabled={deleting}>
+                {deleting ? <Spinner /> : <Icon name="trash" size={15} />} Delete
+              </button>
+              <button className="button button-quiet button-small" type="button" onClick={() => setConfirmDelete(false)} disabled={deleting}>Cancel</button>
+            </div>
+          ) : (
+            <button className="button button-danger-quiet button-small" type="button" onClick={() => setConfirmDelete(true)}>
+              <Icon name="trash" size={15} /> Delete interaction
+            </button>
+          )}
+        </footer>
+      </aside>
+    </div>
+  );
+}
+
+function OobPage({ notify }: { notify: (tone: Notice['tone'], message: string) => void }) {
+  const [probes, setProbes] = useState<OobProbe[]>([]);
+  const [selectedId, setSelectedId] = useState('');
+  const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
+  const [rotating, setRotating] = useState(false);
+  const [creating, setCreating] = useState(false);
+  const [createOpen, setCreateOpen] = useState(false);
+  const [newProbeName, setNewProbeName] = useState('New listener');
+  const [error, setError] = useState('');
+  const [reveal, setReveal] = useState(false);
+  const [deleting, setDeleting] = useState(false);
+
+  const [interactions, setInteractions] = useState<OobInteraction[]>([]);
+  const [interactionCursor, setInteractionCursor] = useState('');
+  const [interactionsLoading, setInteractionsLoading] = useState(false);
+  const [loadingMore, setLoadingMore] = useState(false);
+  const [clearing, setClearing] = useState(false);
+  const [selectedInteraction, setSelectedInteraction] = useState<OobInteraction | null>(null);
+
+  const selected = probes.find((probe) => probe.id === selectedId) || probes[0] || null;
+
+  const load = useCallback(async () => {
+    setLoading(true);
+    setError('');
+    try {
+      const payload = asMap(await apiJson(API + '/oob'));
+      const rows = asList(payload.probes).map(normalizeOobProbe).filter((row) => row.id);
+      setProbes(rows);
+      setSelectedId((current) => rows.some((row) => row.id === current) ? current : rows[0]?.id || '');
+    } catch (caught) {
+      setError(friendlyError(caught));
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    void load();
+  }, [load]);
+
+  const loadInteractions = useCallback(async (probeId: string, cursor = '', append = false) => {
+    if (!probeId) {
+      setInteractions([]);
+      setInteractionCursor('');
+      return;
+    }
+    append ? setLoadingMore(true) : setInteractionsLoading(true);
+    try {
+      const query = new URLSearchParams({ limit: '50', probeId });
+      if (cursor) query.set('cursor', cursor);
+      const payload = asMap(await apiJson(API + '/oob/interactions?' + query.toString()));
+      const rows = asList(payload.interactions).map(normalizeOobInteraction).filter((row) => row.id);
+      setInteractions((current) => append ? [...current, ...rows] : rows);
+      setInteractionCursor(stringValue(payload.nextCursor || payload.next_cursor));
+    } catch (caught) {
+      setError(friendlyError(caught));
+    } finally {
+      setInteractionsLoading(false);
+      setLoadingMore(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    setReveal(false);
+    setSelectedInteraction(null);
+    if (selected?.id) void loadInteractions(selected.id);
+    else {
+      setInteractions([]);
+      setInteractionCursor('');
+    }
+  }, [selected?.id, loadInteractions]);
+
+  function patchLocal(patch: Partial<OobProbe>) {
+    if (!selected) return;
+    setProbes((rows) => rows.map((row) => row.id === selected.id ? { ...row, ...patch } : row));
+  }
+
+  async function createProbe(event: React.FormEvent) {
+    event.preventDefault();
+    if (!newProbeName.trim()) return;
+    setCreating(true);
+    setError('');
+    try {
+      const payload = asMap(await apiJson(API + '/oob', { method: 'POST', body: { name: newProbeName.trim() } }));
+      const probe = normalizeOobProbe(payload.probe);
+      if (!probe.id) throw new Error('The new listener response was incomplete.');
+      setProbes((rows) => [...rows, probe]);
+      setSelectedId(probe.id);
+      setReveal(true);
+      setCreateOpen(false);
+      setNewProbeName('New listener');
+      notify('success', 'New OOB listener created.');
+    } catch (caught) {
+      setError(friendlyError(caught));
+    } finally {
+      setCreating(false);
+    }
+  }
+
+  async function save() {
+    if (!selected) return;
+    setSaving(true);
+    setError('');
+    const body = {
+      name: selected.name.trim(),
+      enabled: selected.enabled,
+      discordNotifications: selected.discordConfigured ? selected.discordNotifications : false,
+    };
+    try {
+      await apiJson(API + '/oob/' + encodeURIComponent(selected.id), { method: 'PATCH', body });
+      patchLocal({ discordNotifications: body.discordNotifications });
+      notify('success', 'Listener settings saved.');
+    } catch (caught) {
+      setError(friendlyError(caught));
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function rotate() {
+    if (!selected) return;
+    setRotating(true);
+    setError('');
+    try {
+      const payload = asMap(await apiJson(API + '/oob/' + encodeURIComponent(selected.id) + '/rotate', {
+        method: 'POST',
+        body: {},
+      }));
+      patchLocal({
+        token: stringValue(payload.token),
+        pathLoaderUrl: stringValue(payload.pathLoaderUrl || payload.path_loader_url),
+        hostLoaderUrl: stringValue(payload.hostLoaderUrl || payload.host_loader_url),
+      });
+      setReveal(true);
+      notify('success', 'Listener token rotated. Old callback URLs stopped working immediately.');
+    } catch (caught) {
+      setError(friendlyError(caught));
+    } finally {
+      setRotating(false);
+    }
+  }
+
+  async function removeProbe() {
+    if (!selected) return;
+    if (!window.confirm(`Delete the listener "${selected.name}" and every captured interaction? This cannot be undone.`)) return;
+    setDeleting(true);
+    setError('');
+    const probeId = selected.id;
+    try {
+      let deleted = false;
+      while (!deleted) {
+        const payload = asMap(await apiJson(API + '/oob/' + encodeURIComponent(probeId), { method: 'DELETE', body: {} }));
+        deleted = booleanValue(payload.deleted);
+      }
+      setProbes((rows) => rows.filter((row) => row.id !== probeId));
+      setSelectedId((current) => current === probeId ? '' : current);
+      notify('success', 'Listener and its interactions deleted.');
+    } catch (caught) {
+      setError(friendlyError(caught));
+    } finally {
+      setDeleting(false);
+    }
+  }
+
+  async function clearInteractions() {
+    if (!selected) return;
+    if (!window.confirm('Permanently delete every captured interaction for this listener?')) return;
+    setClearing(true);
+    setError('');
+    let removed = 0;
+    try {
+      let remaining = true;
+      while (remaining) {
+        const payload = asMap(await apiJson(API + '/oob/interactions', {
+          method: 'DELETE',
+          body: { all: true, probeId: selected.id, confirmation: 'DELETE OOB INTERACTIONS' },
+        }));
+        removed += asList(payload.deletedIds || payload.deleted_ids).length;
+        remaining = booleanValue(payload.remaining);
+      }
+      setSelectedInteraction(null);
+      await loadInteractions(selected.id);
+      notify('success', `Deleted ${removed.toLocaleString()} interactions.`);
+    } catch (caught) {
+      setError(friendlyError(caught));
+    } finally {
+      setClearing(false);
+    }
+  }
+
+  const markInteractionRead = useCallback((id: string) => {
+    setInteractions((rows) => rows.map((row) => row.id === id ? { ...row, isRead: true } : row));
+    setSelectedInteraction((current) => current?.id === id ? { ...current, isRead: true } : current);
+  }, []);
+
+  function removeInteraction(id: string) {
+    setInteractions((rows) => rows.filter((row) => row.id !== id));
+    notify('success', 'Interaction deleted.');
+  }
+
+  return (
+    <>
+      <div className="page-heading">
+        <div>
+          <p className="eyebrow">Out-of-band callbacks</p>
+          <h1>OOB server</h1>
+          <p>Catch blind SSRF, RCE, XXE, and other server-side callbacks over HTTP(S).</p>
+        </div>
+        <div className="heading-actions">
+          <button className="button button-primary" type="button" onClick={() => setCreateOpen(true)}>
+            <Icon name="globe" /> New listener
+          </button>
+          <button className="button button-secondary" type="button" onClick={load} disabled={loading}>
+            {loading ? <Spinner /> : <Icon name="refresh" />} Refresh
+          </button>
+        </div>
+      </div>
+      {error && <ErrorBanner message={error} onDismiss={() => setError('')} />}
+      {loading ? (
+        <div className="page-loading"><Spinner /><span>Unlocking listener configuration…</span></div>
+      ) : !selected ? (
+        <EmptyState
+          icon="globe"
+          title="No OOB listeners"
+          message="Create a listener to get a unique callback URL for out-of-band interaction testing."
+          action={<button className="button button-primary" type="button" onClick={() => setCreateOpen(true)}>Create listener</button>}
+        />
+      ) : (
+        <div className="collector-layout">
+          <aside className="collector-list panel">
+            <div className="panel-title"><span>Listeners</span><small>{probes.length}</small></div>
+            {probes.map((probe) => (
+              <button type="button" className={'collector-option ' + (probe.id === selected.id ? 'selected' : '')} key={probe.id} onClick={() => setSelectedId(probe.id)}>
+                <span className={'collector-dot ' + (probe.enabled ? 'online' : '')} />
+                <span><strong>{probe.name}</strong><small>{probe.enabled ? 'Listening' : 'Paused'}</small></span>
+                <Icon name="chevron" size={15} />
+              </button>
+            ))}
+          </aside>
+          <div className="collector-content">
+            <section className="panel collector-hero">
+              <div>
+                <span className={'health-pill ' + (selected.enabled ? 'healthy' : '')}><i /> {selected.enabled ? 'Accepting callbacks' : 'Listener paused'}</span>
+                <h2>{selected.name}</h2>
+                <p>Created {formatDate(selected.createdAt)} · ID {selected.id}</p>
+              </div>
+              <Icon name="globe" size={36} />
+            </section>
+            <section className="panel section-panel">
+              <div className="section-title-row">
+                <div><h2>Listener token</h2><p>Embedded in every callback URL. Rotate it if it may have leaked.</p></div>
+                <button className="button button-danger-quiet button-small" type="button" onClick={rotate} disabled={rotating}>
+                  {rotating ? <Spinner /> : <Icon name="refresh" size={15} />}
+                  {rotating ? 'Rotating…' : 'Rotate token'}
+                </button>
+              </div>
+              <div className="token-display">
+                <code>{reveal ? selected.token : '••••••••••••••••••••••••••'}</code>
+                <button className="icon-button" type="button" onClick={() => setReveal(!reveal)} aria-label={reveal ? 'Hide token' : 'Reveal token'}>
+                  <Icon name={reveal ? 'eyeOff' : 'eye'} size={17} />
+                </button>
+                <CopyButton value={selected.token} />
+              </div>
+            </section>
+            <section className="panel section-panel">
+              <div className="section-title-row">
+                <div><h2>Callback URLs</h2><p>Use only against systems you are explicitly authorized to test. Any method and path is captured.</p></div>
+                <span className="badge"><Icon name="globe" size={12} /> HTTP(S)</span>
+              </div>
+              <div className="snippet-list">
+                <Snippet label="Path callback (works out of the box)" value={selected.pathLoaderUrl} />
+                {selected.hostLoaderUrl ? (
+                  <Snippet label="Subdomain callback (wildcard host configured)" value={selected.hostLoaderUrl} />
+                ) : null}
+              </div>
+              {!selected.hostLoaderUrl && (
+                <p className="section-copy">
+                  Set the <code>OOB_WILDCARD_HOST</code> variable and route its wildcard to this Worker to also capture
+                  bare-hostname callbacks such as <code>&lt;token&gt;.oob.example.com</code>.
+                </p>
+              )}
+            </section>
+            <section className="panel section-panel settings-panel">
+              <div className="section-title-row">
+                <div><h2>Listener policy</h2></div>
+              </div>
+              <label className="settings-name">
+                <span>Listener name</span>
+                <input value={selected.name} onChange={(e) => patchLocal({ name: e.target.value })} maxLength={80} />
+              </label>
+              <div className="toggle-list">
+                <Toggle checked={selected.enabled} onChange={(value) => patchLocal({ enabled: value })} label="Enable listener" detail="Accept and store new out-of-band interactions." />
+              </div>
+              <div className="notification-settings">
+                <div className="section-title-row">
+                  <div>
+                    <h3>Discord notifications</h3>
+                    <p>Only listener name, interaction ID, HTTP method, and receipt time leave the vault.</p>
+                  </div>
+                </div>
+                <Toggle
+                  checked={selected.discordNotifications}
+                  onChange={(value) => patchLocal({ discordNotifications: value })}
+                  label="Notify Discord for this listener"
+                  detail={selected.discordConfigured
+                    ? 'Delivery runs after encrypted storage succeeds and does not delay the callback response.'
+                    : 'Set the DISCORD_WEBHOOK_URL Cloudflare secret, redeploy, then refresh this page.'}
+                  disabled={!selected.discordConfigured}
+                />
+              </div>
+              <div className="panel-actions">
+                <button className="button button-danger-quiet" type="button" onClick={removeProbe} disabled={deleting || saving}>
+                  {deleting ? <Spinner /> : <Icon name="trash" />} {deleting ? 'Deleting…' : 'Delete listener'}
+                </button>
+                <button className="button button-primary" type="button" onClick={save} disabled={saving || !selected.name.trim()}>
+                  {saving ? <Spinner /> : <Icon name="check" />} {saving ? 'Saving…' : 'Save policy'}
+                </button>
+              </div>
+            </section>
+            <section className="panel event-panel">
+              <div className="section-title-row">
+                <div><h2>Interactions</h2><p>Encrypted out-of-band requests received by this listener.</p></div>
+                <div className="heading-actions">
+                  <button className="button button-danger-quiet button-small" type="button" onClick={clearInteractions} disabled={clearing || interactions.length === 0}>
+                    {clearing ? <Spinner /> : <Icon name="trash" size={15} />} {clearing ? 'Clearing…' : 'Clear'}
+                  </button>
+                  <button className="button button-secondary button-small" type="button" onClick={() => loadInteractions(selected.id)} disabled={interactionsLoading}>
+                    {interactionsLoading ? <Spinner /> : <Icon name="refresh" size={15} />} Refresh
+                  </button>
+                </div>
+              </div>
+              {interactionsLoading ? (
+                <div className="table-loading"><Spinner /><span>Loading encrypted interactions…</span></div>
+              ) : interactions.length === 0 ? (
+                <EmptyState
+                  icon="activity"
+                  title="Waiting for the first callback"
+                  message="Place this listener's URL in an authorized test and interactions will appear here."
+                />
+              ) : (
+                <div className="event-list" role="list">
+                  {interactions.map((interaction) => (
+                    <button className={'event-row ' + (!interaction.isRead ? 'event-unread' : '')} type="button" key={interaction.id} onClick={() => setSelectedInteraction(interaction)} role="listitem">
+                      <span className="event-state">{!interaction.isRead && <i />}</span>
+                      <span className="event-main">
+                        <span className="event-title">{oobInteractionHeadline(interaction)}</span>
+                        <span className="event-url">{stringValue(interaction.summary.query) ? '?' + stringValue(interaction.summary.query) : stringValue(interaction.summary.host, 'no host')}</span>
+                      </span>
+                      <span className="event-badges">
+                        {stringValue(interaction.summary.matchedBy) && <span className="badge">{stringValue(interaction.summary.matchedBy)}</span>}
+                        {numberValue(interaction.summary.bodyBytes || interaction.summary.body_bytes) > 0 && <span className="badge">body</span>}
+                      </span>
+                      <span className="event-meta">
+                        <strong>{stringValue(interaction.summary.ip) || stringValue(interaction.summary.country) || '—'}</strong>
+                        <span title={formatDate(interaction.receivedAt)}>{relativeTime(interaction.receivedAt)}</span>
+                      </span>
+                      <Icon name="chevron" size={17} />
+                    </button>
+                  ))}
+                </div>
+              )}
+              {interactionCursor && (
+                <div className="load-more">
+                  <button className="button button-secondary" type="button" onClick={() => loadInteractions(selected.id, interactionCursor, true)} disabled={loadingMore}>
+                    {loadingMore ? <Spinner /> : null}{loadingMore ? 'Loading…' : 'Load older interactions'}
+                  </button>
+                </div>
+              )}
+            </section>
+          </div>
+        </div>
+      )}
+      {createOpen && (
+        <Modal title="Create OOB listener" onClose={() => !creating && setCreateOpen(false)}>
+          <form className="modal-form" onSubmit={createProbe}>
+            <label>
+              <span>Listener name</span>
+              <input
+                autoFocus
+                value={newProbeName}
+                onChange={(event) => setNewProbeName(event.target.value)}
+                maxLength={80}
+                required
+              />
+            </label>
+            <p>Each listener gets an independent, DNS- and path-safe token and its own callback URL.</p>
+            <div className="panel-actions">
+              <button className="button button-quiet" type="button" onClick={() => setCreateOpen(false)} disabled={creating}>Cancel</button>
+              <button className="button button-primary" type="submit" disabled={creating || !newProbeName.trim()}>
+                {creating ? <Spinner /> : <Icon name="globe" />} {creating ? 'Creating…' : 'Create listener'}
+              </button>
+            </div>
+          </form>
+        </Modal>
+      )}
+      {selectedInteraction && (
+        <OobInteractionDrawer
+          interaction={selectedInteraction}
+          onClose={() => setSelectedInteraction(null)}
+          onDeleted={removeInteraction}
+          onRead={markInteractionRead}
+        />
+      )}
+    </>
+  );
+}
+
 const navigation: Array<{ id: View; label: string; icon: IconName; hint: string }> = [
   { id: 'events', label: 'Events', icon: 'events', hint: 'Capture inbox' },
   { id: 'collectors', label: 'Payloads', icon: 'code', hint: 'Collectors' },
+  { id: 'oob', label: 'OOB', icon: 'globe', hint: 'Out-of-band server' },
   { id: 'security', label: 'Security', icon: 'security', hint: 'Access controls' },
   { id: 'audit', label: 'Audit', icon: 'audit', hint: 'Activity trail' },
 ];
@@ -2247,6 +2886,7 @@ function Dashboard({ session, onLogout }: { session: Session; onLogout: () => vo
         <main className="page-content">
           {view === 'events' && <EventsPage notify={notify} />}
           {view === 'collectors' && <CollectorsPage notify={notify} />}
+          {view === 'oob' && <OobPage notify={notify} />}
           {view === 'security' && <SecurityPage notify={notify} />}
           {view === 'audit' && <AuditPage />}
         </main>

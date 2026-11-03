@@ -72,4 +72,40 @@ describe('static security invariants', () => {
     expect(discord).toContain('allowed_mentions: { parse: [] }');
     expect(discord).not.toMatch(/notice\.(cookies|domHtml|localStorage|sessionStorage|url|referrer)/);
   });
+
+  it('exposes the out-of-band capture endpoint as a public, token-gated path', async () => {
+    const worker = await readFile(new URL('../src/worker.ts', import.meta.url), 'utf8');
+    const oob = await readFile(new URL('../src/routes/oob.ts', import.meta.url), 'utf8');
+    expect(worker).toContain("'/o/'");
+    expect(worker).toContain('oobTokenFromHost');
+    expect(oob).toContain("app.all('/o/:token'");
+    expect(oob).toContain("keyedHash(env, 'oob-token', token)");
+    // Enabled listeners only, enforced again at insert time.
+    expect(oob).toContain('AND enabled = 1');
+    expect(oob).toContain('EXISTS (');
+  });
+
+  it('returns a uniform, inert out-of-band response that never reflects input', async () => {
+    const oob = await readFile(new URL('../src/routes/oob.ts', import.meta.url), 'utf8');
+    // The only Response in the capture path has an empty, fixed body.
+    expect(oob).toContain("return new Response('', {");
+    expect(oob).not.toMatch(/new Response\((?!'')/);
+  });
+
+  it('encrypts and hashes out-of-band listener tokens like collector tokens', async () => {
+    const migration = await readFile(new URL('../migrations/0006_oob_interactions.sql', import.meta.url), 'utf8');
+    expect(migration).toContain('token_hash TEXT NOT NULL UNIQUE');
+    expect(migration).toContain('token_ciphertext TEXT NOT NULL');
+    expect(migration).toContain('CREATE TABLE oob_interactions');
+    expect(migration).toContain('detail_key TEXT NOT NULL');
+  });
+
+  it('keeps out-of-band Discord delivery metadata-only and off the capture critical path', async () => {
+    const oob = await readFile(new URL('../src/routes/oob.ts', import.meta.url), 'utf8');
+    const discord = await readFile(new URL('../src/lib/discord.ts', import.meta.url), 'utf8');
+    expect(oob).toContain('ctx.waitUntil(');
+    expect(oob).toContain('sendDiscordOobNotification');
+    // The out-of-band notice carries no captured request content.
+    expect(discord).not.toMatch(/notice\.(path|host|body|query|headers|ip|country|userAgent)/);
+  });
 });

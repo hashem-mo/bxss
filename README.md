@@ -33,6 +33,10 @@ storage, or authentication design.
   objects, D1 event rows, stale sessions, challenges, and unmatched requests.
 - Collector-bound, HMAC-authenticated runtime URLs; unsigned or modified probe
   configuration is not served.
+- Integrated out-of-band (OOB) HTTP interaction server for blind SSRF, RCE, XXE,
+  and callback testing, sharing the same encryption, quotas, retention, and
+  notifications; its endpoint returns one uniform inert response and never
+  reflects input.
 
 Read [SECURITY.md](./SECURITY.md) before placing real data in the vault.
 
@@ -262,6 +266,57 @@ Invoke-RestMethod -Method Post `
 
 Collector tokens are public write capabilities because they appear in payload
 source. They never authorize reads. Rotate one immediately if it is abused.
+
+## Out-of-band interaction server
+
+Blind vulnerabilities such as SSRF, blind command injection, XXE, and
+template/JNDI callbacks are often proven out of band: the target *server* (not a
+browser) reaches a URL you control. The **OOB** page issues listeners for this.
+
+Each listener has its own DNS- and path-safe token (128-bit, lowercase base32)
+and two callback forms:
+
+```text
+https://collector.example.com/o/COLLECTOR_26CHAR_TOKEN
+COLLECTOR_26CHAR_TOKEN.oob.example.com   (optional, see below)
+```
+
+Any HTTP method and any path or query under the token is captured. Place the URL
+wherever a blind payload can trigger a server-side fetch, for example:
+
+```text
+curl https://collector.example.com/o/COLLECTOR_26CHAR_TOKEN/blind-rce
+<!ENTITY xxe SYSTEM "https://collector.example.com/o/COLLECTOR_26CHAR_TOKEN">
+```
+
+The Worker records the method, host, path, query, request headers, and a bounded
+request body together with the Cloudflare-derived source IP, country, and colo.
+Everything is encrypted with AES-256-GCM, charged against the same R2 storage
+budget and daily cap as blind-XSS captures, swept by the same retention cron, and
+viewable in the dashboard rendered as inert text. Optional Discord delivery is
+metadata-only (listener name, interaction ID, HTTP method, receipt time).
+
+The endpoint always answers with one short, fixed, non-reflecting response and
+permissive CORS so browser-driven callbacks and their preflights also complete.
+Unknown, disabled, and rate-limited tokens are indistinguishable from active
+ones, so the endpoint cannot be used to enumerate listeners. Rotating a listener
+token immediately disables its old callback URLs.
+
+### Bare-hostname (wildcard) capture
+
+Path callbacks work out of the box. Some payloads can only specify a hostname.
+To also capture `TOKEN.oob.example.com`, pick a dedicated host, point a wildcard
+at this Worker (a `*.oob.example.com` custom hostname/route and matching DNS),
+and set:
+
+```jsonc
+"OOB_WILDCARD_HOST": "oob.example.com"
+```
+
+Only the immediate leftmost label is treated as the token. Do not place the
+wildcard host behind Cloudflare Access or callbacks will fail. This server is
+HTTP(S) only; capturing DNS-only interactions needs an authoritative nameserver,
+which a Worker cannot provide.
 
 ## Backups and key loss
 
