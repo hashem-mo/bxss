@@ -92,6 +92,18 @@ describe('static security invariants', () => {
     expect(oob).not.toMatch(/new Response\((?!'')/);
   });
 
+  it('keeps the listener token out of the non-step-up interaction summary', async () => {
+    const oob = await readFile(new URL('../src/routes/oob.ts', import.meta.url), 'utf8');
+    const admin = await readFile(new URL('../src/routes/admin.ts', import.meta.url), 'utf8');
+    // The summary (served by the non-step-up list) uses token-redacted fields.
+    expect(oob).toContain('redactToken(url.pathname, token)');
+    expect(oob).toContain('redactToken(url.host, token)');
+    expect(oob).toContain('host: summaryHost');
+    expect(oob).toContain('path: summaryPath');
+    // The full request line stays in the detail, which is step-up gated.
+    expect(admin).toMatch(/app\.get\('\/oob\/interactions\/:id'[\s\S]{0,120}requireStepUp\(c\)/);
+  });
+
   it('encrypts and hashes out-of-band listener tokens like collector tokens', async () => {
     const migration = await readFile(new URL('../migrations/0006_oob_interactions.sql', import.meta.url), 'utf8');
     expect(migration).toContain('token_hash TEXT NOT NULL UNIQUE');

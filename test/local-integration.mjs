@@ -264,12 +264,16 @@ try {
   const oobInteractionId = oobList.interactions[0].id;
   const oobSummary = oobList.interactions[0].summary;
   assert(oobSummary.method === 'POST', 'oob summary method did not round-trip');
-  assert(oobSummary.path === `/o/${probe.token}/blind-rce`, 'oob summary path did not round-trip');
-  assert(oobSummary.query === 'x=1', 'oob summary query did not round-trip');
   assert(oobSummary.matchedBy === 'path', 'oob summary match source did not round-trip');
+  assert(oobSummary.query === 'x=1', 'oob summary query did not round-trip');
+  // The non-step-up summary must not disclose the listener token, but must keep
+  // the capture sub-path for triage.
+  assert(!oobSummary.path.includes(probe.token), 'listener token leaked into the non-step-up summary');
+  assert(oobSummary.path.includes('/blind-rce'), 'oob summary path lost its capture sub-path');
 
   const viewedOob = await (await fetch(`${origin}/api/oob/interactions/${oobInteractionId}`, { headers: authHeaders })).json();
   const oobDetail = viewedOob.interaction.detail;
+  assert(oobDetail.path === `/o/${probe.token}/blind-rce`, 'step-up detail should retain the full request path');
   assert(oobDetail.body === JSON.stringify({ probe: 'oob' }), 'encrypted oob body did not round-trip');
   assert(
     Array.isArray(oobDetail.headers) && oobDetail.headers.some((header) => header.name === 'x-synthetic-oob' && header.value === 'yes'),

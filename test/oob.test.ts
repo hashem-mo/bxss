@@ -14,6 +14,7 @@ import {
   oobPathLoader,
   oobTokenFromHost,
   oobTokenFromPath,
+  redactToken,
 } from '../src/lib/oob';
 
 describe('OOB tokens', () => {
@@ -75,6 +76,14 @@ describe('OOB token resolution', () => {
     expect(oobTokenFromHost(`${token}.other.example.com`, host)).toBeNull();
     expect(oobTokenFromHost('oob.example.com', host)).toBeNull();
     expect(oobTokenFromHost(`${token}.oob.example.com`, '')).toBeNull();
+  });
+
+  it('redacts the listener token from captured values without touching the rest', () => {
+    expect(redactToken(`/o/${token}/blind-rce`, token)).toBe('/o/…/blind-rce');
+    expect(redactToken(`${token}.oob.example.com`, token)).toBe('….oob.example.com');
+    expect(redactToken(`/o/${token}`, token)).not.toContain(token);
+    expect(redactToken('/no/token/here', token)).toBe('/no/token/here');
+    expect(redactToken('anything', '')).toBe('anything');
   });
 
   it('builds loader URLs', () => {

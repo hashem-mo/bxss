@@ -110,6 +110,15 @@ export function oobHostLoader(wildcardHost: string, token: string): string {
   return wildcardHost ? `${token}.${wildcardHost}` : '';
 }
 
+/**
+ * Removes a listener token from a captured value so it can be shown in the
+ * non-step-up interaction list without disclosing the secret. The full request
+ * line, including the token, is retained only in the step-up-gated detail.
+ */
+export function redactToken(value: string, token: string): string {
+  return token ? value.split(token).join('…') : value;
+}
+
 /** Collapses a raw header/metadata string to bounded, inert single-line text. */
 export function boundOobText(value: string, maxBytes: number): string {
   const cleaned = value.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, ' ');

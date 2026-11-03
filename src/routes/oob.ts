@@ -16,6 +16,7 @@ import {
   OOB_QUERY_MAX_BYTES,
   OOB_USER_AGENT_MAX_BYTES,
   oobTokenFromPath,
+  redactToken,
 } from '../lib/oob';
 
 const app = new Hono<{ Bindings: Env; Variables: Variables }>();
@@ -149,11 +150,21 @@ export async function captureOob(
   if (Number(today?.count ?? 0) >= maxPerDay) return oobResponse();
 
   const url = new URL(request.url);
+  const rawUserAgent = request.headers.get('User-Agent') ?? '';
   const method = boundOobText(request.method, OOB_METHOD_MAX_BYTES);
+  // The detail is step-up-gated, so it keeps the full request line (which, for a
+  // path/host capture, contains the listener token). The summary is served by the
+  // non-step-up interactions list, so the token is redacted from the raw value
+  // before bounding — redacting first prevents truncation leaving a token
+  // fragment behind.
   const host = boundOobText(url.host, OOB_HOST_MAX_BYTES);
   const path = boundOobText(url.pathname, OOB_PATH_MAX_BYTES);
   const query = boundOobText(url.search.replace(/^\?/, ''), OOB_QUERY_MAX_BYTES);
-  const userAgent = boundOobText(request.headers.get('User-Agent') ?? '', OOB_USER_AGENT_MAX_BYTES);
+  const userAgent = boundOobText(rawUserAgent, OOB_USER_AGENT_MAX_BYTES);
+  const summaryHost = boundOobText(redactToken(url.host, token), OOB_HOST_MAX_BYTES);
+  const summaryPath = boundOobText(redactToken(url.pathname, token), OOB_PATH_MAX_BYTES);
+  const summaryQuery = boundOobText(redactToken(url.search.replace(/^\?/, ''), token), OOB_QUERY_MAX_BYTES);
+  const summaryUserAgent = boundOobText(redactToken(rawUserAgent, token), OOB_USER_AGENT_MAX_BYTES);
   const { headers, count: headerCount } = boundOobHeaders(request.headers);
   const body = await readCapturedBody(request, method);
 
@@ -163,13 +174,13 @@ export async function captureOob(
 
   const summary: OobInteractionSummary = {
     method,
-    host,
-    path,
-    query,
+    host: summaryHost,
+    path: summaryPath,
+    query: summaryQuery,
     matchedBy,
     ip,
     country,
-    userAgent,
+    userAgent: summaryUserAgent,
     headerCount,
     bodyBytes: body.byteLength,
     bodyTruncated: body.truncated,
