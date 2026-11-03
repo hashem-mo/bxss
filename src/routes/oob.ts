@@ -9,6 +9,7 @@ import {
   boundOobHeaders,
   boundOobText,
   encodeOobBody,
+  MAX_OOB_BODY_BYTES,
   OOB_HOST_MAX_BYTES,
   OOB_METHOD_MAX_BYTES,
   OOB_PATH_MAX_BYTES,
@@ -20,10 +21,6 @@ import {
 const app = new Hono<{ Bindings: Env; Variables: Variables }>();
 type OobContext = Context<{ Bindings: Env; Variables: Variables }>;
 
-// Reading an entire multi-megabyte callback body into memory is never worth it:
-// only the first MAX_OOB_BODY_BYTES are retained anyway. Bodies that declare a
-// length beyond this are recorded as truncated without being buffered.
-const OOB_BODY_READ_CAP = 2 * 1_024 * 1_024;
 const BODYLESS_METHODS = new Set(['GET', 'HEAD', 'OPTIONS']);
 
 /**
@@ -53,23 +50,70 @@ interface ProbeRow {
   discord_notifications: number;
 }
 
-async function readCapturedBody(request: Request, method: string) {
-  if (BODYLESS_METHODS.has(method.toUpperCase())) {
-    return { body: '', encoding: 'utf-8' as const, byteLength: 0, truncated: false };
-  }
+function declaredLength(request: Request): number | null {
   const declared = request.headers.get('Content-Length');
-  if (declared && /^\d+$/.test(declared)) {
-    const length = Number.parseInt(declared, 10);
-    if (Number.isSafeInteger(length) && length > OOB_BODY_READ_CAP) {
-      return { body: '', encoding: 'utf-8' as const, byteLength: length, truncated: true };
+  if (!declared || !/^\d+$/.test(declared)) return null;
+  const length = Number.parseInt(declared, 10);
+  return Number.isSafeInteger(length) && length >= 0 ? length : null;
+}
+
+/**
+ * Reads at most MAX_OOB_BODY_BYTES of the request body by streaming, so a
+ * hostile or chunked callback can never force the Worker to buffer an arbitrary
+ * amount of memory. The true size is taken from Content-Length when it is
+ * present and consistent; otherwise it is the number of bytes actually read.
+ */
+async function readCapturedBody(
+  request: Request,
+  method: string,
+): Promise<{ body: string; encoding: 'utf-8' | 'base64url'; byteLength: number; truncated: boolean }> {
+  const empty = { body: '', encoding: 'utf-8' as const, byteLength: 0, truncated: false };
+  if (BODYLESS_METHODS.has(method.toUpperCase()) || !request.body) return empty;
+
+  const declared = declaredLength(request);
+  const reader = request.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let read = 0;
+  let overflow = false;
+  try {
+    while (read < MAX_OOB_BODY_BYTES) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (!value || value.byteLength === 0) continue;
+      const remaining = MAX_OOB_BODY_BYTES - read;
+      if (value.byteLength > remaining) {
+        chunks.push(value.subarray(0, remaining));
+        read += remaining;
+        overflow = true;
+        break;
+      }
+      chunks.push(value);
+      read += value.byteLength;
+    }
+    if (!overflow && read >= MAX_OOB_BODY_BYTES) {
+      const next = await reader.read();
+      if (!next.done && next.value && next.value.byteLength > 0) overflow = true;
+    }
+  } catch {
+    // A partial body is still worth recording; fall through with what we have.
+  } finally {
+    try {
+      await reader.cancel();
+    } catch {
+      // Cancelling an already-finished stream is not an error.
     }
   }
-  try {
-    const buffer = await request.arrayBuffer();
-    return encodeOobBody(new Uint8Array(buffer));
-  } catch {
-    return { body: '', encoding: 'utf-8' as const, byteLength: 0, truncated: false };
+
+  const combined = new Uint8Array(read);
+  let offset = 0;
+  for (const chunk of chunks) {
+    combined.set(chunk, offset);
+    offset += chunk.byteLength;
   }
+  const encoded = encodeOobBody(combined);
+  const truncated = overflow || (declared !== null && declared > read);
+  const byteLength = declared !== null && declared >= read ? declared : read;
+  return { body: encoded.body, encoding: encoded.encoding, byteLength, truncated };
 }
 
 /**
