@@ -302,6 +302,28 @@ Unknown, disabled, and rate-limited tokens are indistinguishable from active
 ones, so the endpoint cannot be used to enumerate listeners. Rotating a listener
 token immediately disables its old callback URLs.
 
+### Controlling the response
+
+By default every listener answers with one inert, empty `200` (identical for
+unknown and disabled tokens, so listeners cannot be enumerated). A listener can
+instead be configured, from **OOB → Response**, to serve a custom response — the
+status code, response headers, and body — when a vulnerability depends on what
+comes back:
+
+- an XXE that needs a valid DTD or SOAP body returned,
+- an SSRF you want to redirect onward with a `3xx` status and a `Location`
+  header (for example toward an internal address in an authorized test),
+- a parser that only triggers on a specific `Content-Type`.
+
+Headers are entered one `Name: Value` per line (up to 16; names and ASCII values
+only, no `Content-Length`/`Transfer-Encoding`). The body is served verbatim up
+to 8 KiB. Capture still happens regardless of what is returned, and the Worker
+keeps enforcing a fixed set of security headers (`nosniff`, framing, CORP) on
+top of the configured response. Enabling a custom response makes that listener
+distinguishable from the default, so leave it off unless the engagement needs
+it. The response is served on your collector origin, so only configure content
+you are authorized to serve there.
+
 ### Bare-hostname (wildcard) capture
 
 Path callbacks work out of the box. Some payloads can only specify a hostname.

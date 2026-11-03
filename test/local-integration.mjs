@@ -283,7 +283,73 @@ try {
   const oobExport = await (await fetch(`${origin}/api/export/oob`, { headers: authHeaders })).json();
   assert(oobExport.interactions?.[0]?.detail?.body === JSON.stringify({ probe: 'oob' }), 'oob interaction did not export');
 
-  // Disabled listeners stop capturing while still returning the uniform response.
+  // Custom response control: the operator decides status, headers, and body.
+  const configured = await fetch(`${origin}/api/oob/${probe.id}`, {
+    method: 'PATCH',
+    headers: mutationHeaders,
+    body: JSON.stringify({
+      response: {
+        status: 418,
+        body: '<x>dtd</x>',
+        headers: [
+          { name: 'Content-Type', value: 'application/xml' },
+          { name: 'X-OOB', value: 'served' },
+        ],
+      },
+    }),
+  });
+  assert(configured.status === 200, `oob response config returned ${configured.status}`);
+  assert((await configured.json()).probe?.response?.status === 418, 'oob response config did not round-trip');
+
+  const served = await fetch(`${origin}/o/${probe.token}/with-response`);
+  assert(served.status === 418, `configured oob response status was ${served.status}`);
+  assert(served.headers.get('content-type') === 'application/xml', 'configured content-type was not served');
+  assert(served.headers.get('x-oob') === 'served', 'configured custom header was not served');
+  assert(served.headers.get('access-control-allow-origin') === '*', 'default CORS header was dropped');
+  assert((await served.text()) === '<x>dtd</x>', 'configured response body was not served');
+
+  // Framing / injection headers must be rejected by the admin API.
+  const forbidden = await fetch(`${origin}/api/oob/${probe.id}`, {
+    method: 'PATCH',
+    headers: mutationHeaders,
+    body: JSON.stringify({ response: { status: 200, headers: [{ name: 'Content-Length', value: '9' }] } }),
+  });
+  assert(forbidden.status === 422, `forbidden response header should be rejected, got ${forbidden.status}`);
+
+  // A 3xx + Location redirect (SSRF chaining) is served as configured.
+  const redirectConfig = await fetch(`${origin}/api/oob/${probe.id}`, {
+    method: 'PATCH',
+    headers: mutationHeaders,
+    body: JSON.stringify({ response: { status: 302, headers: [{ name: 'Location', value: 'https://authorized.internal/' }] } }),
+  });
+  assert(redirectConfig.status === 200, `redirect config returned ${redirectConfig.status}`);
+  const redirected = await fetch(`${origin}/o/${probe.token}`, { redirect: 'manual' });
+  assert(redirected.status === 302, `redirect status was ${redirected.status}`);
+  assert(redirected.headers.get('location') === 'https://authorized.internal/', 'redirect Location was not served');
+
+  // Clearing reverts to the inert empty 200 default.
+  const cleared = await fetch(`${origin}/api/oob/${probe.id}`, {
+    method: 'PATCH',
+    headers: mutationHeaders,
+    body: JSON.stringify({ response: null }),
+  });
+  assert(cleared.status === 200 && (await cleared.json()).probe?.response === null, 'custom response was not cleared');
+  const defaulted = await fetch(`${origin}/o/${probe.token}`);
+  assert(defaulted.status === 200 && (await defaulted.text()) === '', 'listener did not revert to the empty 200 default');
+
+  // Reset the interaction log (the response probes above were captured too).
+  for (let guard = 0; guard < 20; guard += 1) {
+    const payload = await (await fetch(`${origin}/api/oob/interactions`, {
+      method: 'DELETE',
+      headers: mutationHeaders,
+      body: JSON.stringify({ all: true, probeId: probe.id, confirmation: 'DELETE OOB INTERACTIONS' }),
+    })).json();
+    if (!payload.remaining) break;
+  }
+  const afterClear = await (await fetch(`${origin}/api/oob/interactions?probeId=${probe.id}`, { headers: authHeaders })).json();
+  assert((afterClear.interactions?.length ?? 0) === 0, 'per-probe interaction clear did not empty the log');
+
+  // Disabled listeners stop capturing while still returning a response.
   const paused = await fetch(`${origin}/api/oob/${probe.id}`, {
     method: 'PATCH',
     headers: mutationHeaders,
@@ -292,9 +358,9 @@ try {
   assert(paused.status === 200, `oob listener pause returned ${paused.status}`);
   assert((await fetch(`${origin}/o/${probe.token}`, { method: 'POST', headers: { 'Content-Type': 'text/plain' }, body: 'x' })).status === 200, 'paused oob listener leaked state');
   const afterPaused = await (await fetch(`${origin}/api/oob/interactions?probeId=${probe.id}`, { headers: authHeaders })).json();
-  assert(afterPaused.interactions?.length === 1, 'paused oob listener committed an interaction');
+  assert((afterPaused.interactions?.length ?? 0) === 0, 'paused oob listener committed an interaction');
 
-  // Deleting the listener drains its interactions and removes the listener row.
+  // Deleting the listener removes the listener row.
   let deletedProbe = false;
   for (let attempt = 0; attempt < 10 && !deletedProbe; attempt += 1) {
     const payload = await (await fetch(`${origin}/api/oob/${probe.id}`, { method: 'DELETE', headers: mutationHeaders, body: '{}' })).json();

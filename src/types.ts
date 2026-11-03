@@ -102,6 +102,9 @@ export interface OobProbeRecord {
   token_iv: string;
   enabled: number;
   discord_notifications: number;
+  response_status: number | null;
+  response_body: string;
+  response_headers: string;
   created_at: number;
   updated_at: number;
 }

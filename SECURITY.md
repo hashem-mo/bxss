@@ -23,7 +23,13 @@ even when a capture came from an authorized target.
   and receipt time; they never contain captured content.
 - If you enable the out-of-band wildcard host (`OOB_WILDCARD_HOST`), keep it off
   the console hostname and never place it behind Cloudflare Access. It is a
-  public, token-gated capture surface that returns one uniform inert response.
+  public, token-gated capture surface.
+- A per-listener custom OOB response is served on the collector origin. It is
+  operator-authored, validated (field-name token, ASCII values, no CR/LF, no
+  framing headers) and token-gated, but it does let that origin return
+  operator-chosen status, headers (including `Location`/`Set-Cookie`) and body —
+  so treat it as content you are publishing there, and only configure authorized
+  content. The default empty `200` response remains in force until you opt in.
 - Keep `DISCORD_WEBHOOK_URL` only as a Cloudflare Worker secret. Treat it as a
   credential because anyone holding it can post into the configured channel.
 - Keep the console free of third-party scripts, fonts, tag managers, and

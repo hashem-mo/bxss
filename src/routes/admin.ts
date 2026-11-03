@@ -6,7 +6,17 @@ import { createCollectorAlias, isCollectorAlias } from '../lib/collector-identif
 import { keyedHash, openBytes, openJson, sealJson, unpackSealed } from '../lib/crypto';
 import { bytesToBase64Url, fromUtf8, randomId, randomToken, safeJsonParse, utf8 } from '../lib/encoding';
 import { discordWebhookConfigured, sendDiscordTestNotification } from '../lib/discord';
-import { createOobToken, normalizeOobWildcardHost, oobHostLoader, oobPathLoader } from '../lib/oob';
+import {
+  canonicalOobResponse,
+  createOobToken,
+  normalizeOobWildcardHost,
+  OOB_RESPONSE_BODY_MAX_BYTES,
+  OOB_RESPONSE_HEADER_MAX_COUNT,
+  OOB_RESPONSE_HEADER_NAME_MAX,
+  OOB_RESPONSE_HEADER_VALUE_MAX,
+  oobHostLoader,
+  oobPathLoader,
+} from '../lib/oob';
 import {
   collectorOrigin,
   intSetting,
@@ -142,11 +152,31 @@ const collectorUpdateSchema = z
   .refine((value) => Object.keys(value).length > 0, 'At least one collector setting is required.');
 
 const oobProbeCreateSchema = z.object({ name: z.string().trim().min(1).max(80) }).strict();
+const oobResponseInputSchema = z
+  .object({
+    status: z.number().int().min(100).max(599),
+    body: z.string().max(OOB_RESPONSE_BODY_MAX_BYTES).default(''),
+    headers: z
+      .array(
+        z
+          .object({
+            name: z.string().min(1).max(OOB_RESPONSE_HEADER_NAME_MAX),
+            value: z.string().max(OOB_RESPONSE_HEADER_VALUE_MAX),
+          })
+          .strict(),
+      )
+      .max(OOB_RESPONSE_HEADER_MAX_COUNT)
+      .default([]),
+  })
+  .strict();
 const oobProbeUpdateSchema = z
   .object({
     name: z.string().trim().min(1).max(80).optional(),
     enabled: z.boolean().optional(),
     discordNotifications: z.boolean().optional(),
+    // null clears any custom response (back to the uniform default); an object
+    // sets one. The authoritative validation runs through canonicalOobResponse.
+    response: z.union([z.null(), oobResponseInputSchema]).optional(),
   })
   .strict()
   .refine((value) => Object.keys(value).length > 0, 'At least one listener setting is required.');
@@ -542,7 +572,8 @@ app.get('/export/events', async (c) => {
       const oobWildcardHost = normalizeOobWildcardHost(c.env.OOB_WILDCARD_HOST);
       const oobProbes = await c.env.DB.prepare(
         `SELECT id, user_id, name, token_hash, token_ciphertext, token_iv,
-                enabled, discord_notifications, created_at, updated_at
+                enabled, discord_notifications, response_status, response_body, response_headers,
+                created_at, updated_at
            FROM oob_probes WHERE user_id = ? ORDER BY created_at ASC, id ASC`,
       )
         .bind(session.userId)
@@ -1475,6 +1506,13 @@ async function decryptOobProbe(
     ciphertext: probe.token_ciphertext,
     iv: probe.token_iv,
   });
+  const response = probe.response_status === null
+    ? null
+    : canonicalOobResponse({
+        status: probe.response_status,
+        body: probe.response_body ?? '',
+        headers: safeJsonParse<unknown>(probe.response_headers ?? '[]', []),
+      });
   return {
     id: probe.id,
     name: probe.name,
@@ -1485,6 +1523,7 @@ async function decryptOobProbe(
     enabled: probe.enabled === 1,
     discordNotifications: probe.discord_notifications === 1,
     discordConfigured: discordWebhookConfigured(env),
+    response,
     createdAt: Number(probe.created_at),
     updatedAt: Number(probe.updated_at),
   };
@@ -1493,7 +1532,8 @@ async function decryptOobProbe(
 async function ownedOobProbe(env: Env, userId: string, probeId: string): Promise<OobProbeRecord | null> {
   return env.DB.prepare(
     `SELECT id, user_id, name, token_hash, token_ciphertext, token_iv,
-            enabled, discord_notifications, created_at, updated_at
+            enabled, discord_notifications, response_status, response_body, response_headers,
+            created_at, updated_at
        FROM oob_probes
       WHERE id = ? AND user_id = ?`,
   )
@@ -1595,7 +1635,8 @@ app.get('/oob', async (c) => {
   const session = c.get('session');
   const result = await c.env.DB.prepare(
     `SELECT id, user_id, name, token_hash, token_ciphertext, token_iv,
-            enabled, discord_notifications, created_at, updated_at
+            enabled, discord_notifications, response_status, response_body, response_headers,
+            created_at, updated_at
        FROM oob_probes
       WHERE user_id = ?
       ORDER BY created_at ASC, id ASC`,
@@ -1888,6 +1929,25 @@ app.patch('/oob/:id', async (c) => {
   const probe = await ownedOobProbe(c.env, session.userId, c.req.param('id'));
   if (!probe) return jsonError(c, 404, 'oob_not_found', 'Listener not found.');
 
+  let responseStatus = probe.response_status;
+  let responseBody = probe.response_body;
+  let responseHeaders = probe.response_headers;
+  if (body.data.response !== undefined) {
+    if (body.data.response === null) {
+      responseStatus = null;
+      responseBody = '';
+      responseHeaders = '[]';
+    } else {
+      const canonical = canonicalOobResponse(body.data.response);
+      if (!canonical) {
+        return jsonError(c, 422, 'invalid_response', 'The listener response configuration is invalid.');
+      }
+      responseStatus = canonical.status;
+      responseBody = canonical.body;
+      responseHeaders = JSON.stringify(canonical.headers);
+    }
+  }
+
   const updated = {
     name: body.data.name ?? probe.name,
     enabled: body.data.enabled ?? probe.enabled === 1,
@@ -1895,13 +1955,17 @@ app.patch('/oob/:id', async (c) => {
   };
   const result = await c.env.DB.prepare(
     `UPDATE oob_probes
-        SET name = ?, enabled = ?, discord_notifications = ?, updated_at = ?
+        SET name = ?, enabled = ?, discord_notifications = ?,
+            response_status = ?, response_body = ?, response_headers = ?, updated_at = ?
       WHERE id = ? AND user_id = ?`,
   )
     .bind(
       updated.name,
       updated.enabled ? 1 : 0,
       updated.discordNotifications ? 1 : 0,
+      responseStatus,
+      responseBody,
+      responseHeaders,
       currentTime(),
       probe.id,
       session.userId,

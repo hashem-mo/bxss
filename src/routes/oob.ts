@@ -2,12 +2,13 @@ import type { Context } from 'hono';
 import { Hono } from 'hono';
 import type { Env, OobInteractionSummary, Variables } from '../types';
 import { keyedHash, packSealed, sealJson } from '../lib/crypto';
-import { randomId } from '../lib/encoding';
+import { randomId, safeJsonParse } from '../lib/encoding';
 import { intSetting } from '../lib/http';
 import { discordWebhookConfigured, sendDiscordOobNotification } from '../lib/discord';
 import {
   boundOobHeaders,
   boundOobText,
+  canonicalOobResponse,
   encodeOobBody,
   MAX_OOB_BODY_BYTES,
   OOB_HOST_MAX_BYTES,
@@ -15,8 +16,11 @@ import {
   OOB_PATH_MAX_BYTES,
   OOB_QUERY_MAX_BYTES,
   OOB_USER_AGENT_MAX_BYTES,
+  oobResponseSpec,
   oobTokenFromPath,
   redactToken,
+  type OobResponsePolicy,
+  type OobResponseSpec,
 } from '../lib/oob';
 
 const app = new Hono<{ Bindings: Env; Variables: Variables }>();
@@ -24,31 +28,45 @@ type OobContext = Context<{ Bindings: Env; Variables: Variables }>;
 
 const BODYLESS_METHODS = new Set(['GET', 'HEAD', 'OPTIONS']);
 
+function responseFromSpec(spec: OobResponseSpec): Response {
+  const headers = new Headers();
+  for (const [name, value] of spec.headers) {
+    try {
+      headers.set(name, value);
+    } catch {
+      // Skip any header the runtime rejects; validation should prevent this.
+    }
+  }
+  return new Response(spec.body, { status: spec.status, headers });
+}
+
 /**
- * A uniform, inert response for every out-of-band request. It never reflects
- * input and is identical for known, unknown, and disabled tokens so the
- * endpoint cannot be used to enumerate active listeners. Permissive CORS lets
- * browser-driven callbacks (and their preflights) complete and be captured.
+ * The uniform, inert default response. It is identical for unknown, disabled,
+ * and rate-limited tokens so the endpoint cannot be used to enumerate active
+ * listeners, and for listeners that have not opted into a custom response.
+ * Permissive CORS lets browser-driven callbacks and their preflights complete.
  */
 function oobResponse(status = 200): Response {
-  return new Response('', {
-    status,
-    headers: {
-      'Content-Type': 'text/plain; charset=utf-8',
-      'Cache-Control': 'no-store',
-      'Access-Control-Allow-Origin': '*',
-      'Access-Control-Allow-Methods': 'GET, POST, PUT, PATCH, DELETE, OPTIONS, HEAD',
-      'Access-Control-Allow-Headers': '*',
-      'Access-Control-Max-Age': '600',
-      'X-Content-Type-Options': 'nosniff',
-    },
-  });
+  return responseFromSpec(oobResponseSpec(null, status));
 }
 
 interface ProbeRow {
   id: string;
   name: string;
   discord_notifications: number;
+  response_status: number | null;
+  response_body: string;
+  response_headers: string;
+}
+
+/** Resolves a listener's stored response configuration, or null for the default. */
+function probeResponsePolicy(probe: ProbeRow): OobResponsePolicy | null {
+  if (probe.response_status === null) return null;
+  return canonicalOobResponse({
+    status: probe.response_status,
+    body: probe.response_body ?? '',
+    headers: safeJsonParse<unknown>(probe.response_headers ?? '[]', []),
+  });
 }
 
 function declaredLength(request: Request): number | null {
@@ -134,12 +152,17 @@ export async function captureOob(
   if (!allowed.success) return oobResponse(429);
 
   const probe = await env.DB.prepare(
-    'SELECT id, name, discord_notifications FROM oob_probes WHERE token_hash = ? AND enabled = 1',
+    `SELECT id, name, discord_notifications, response_status, response_body, response_headers
+       FROM oob_probes WHERE token_hash = ? AND enabled = 1`,
   )
     .bind(tokenHash)
     .first<ProbeRow>();
-  // Unknown or disabled listeners still receive the uniform success response.
+  // Unknown or disabled listeners still receive the uniform default response.
   if (!probe) return oobResponse();
+
+  // Resolved once, so every known-listener exit (capture, cap, storage failure)
+  // returns the same operator-configured response the target expects.
+  const respond = (): Response => responseFromSpec(oobResponseSpec(probeResponsePolicy(probe)));
 
   const current = Math.floor(Date.now() / 1_000);
   const createdDay = new Date(current * 1_000).toISOString().slice(0, 10);
@@ -147,7 +170,7 @@ export async function captureOob(
   const today = await env.DB.prepare('SELECT COUNT(*) AS count FROM oob_interactions WHERE created_day = ?')
     .bind(createdDay)
     .first<{ count: number }>();
-  if (Number(today?.count ?? 0) >= maxPerDay) return oobResponse();
+  if (Number(today?.count ?? 0) >= maxPerDay) return respond();
 
   const url = new URL(request.url);
   const rawUserAgent = request.headers.get('User-Agent') ?? '';
@@ -222,7 +245,7 @@ export async function captureOob(
   )
     .bind(totalBytes, current, totalBytes, maxStorageBytes)
     .first<{ storage_bytes: number }>();
-  if (!reservation) return oobResponse();
+  if (!reservation) return respond();
 
   const detailKey = `oob/${probe.id}/${interactionId}/detail.bin`;
   try {
@@ -258,7 +281,7 @@ export async function captureOob(
       )
         .bind(totalBytes, current)
         .run();
-      return oobResponse();
+      return respond();
     }
     if (probe.discord_notifications === 1 && discordWebhookConfigured(env)) {
       ctx.waitUntil(
@@ -270,7 +293,7 @@ export async function captureOob(
         }).then(() => undefined),
       );
     }
-    return oobResponse();
+    return respond();
   } catch {
     await env.VAULT.delete(detailKey).catch(() => undefined);
     await env.DB.prepare(
@@ -278,7 +301,7 @@ export async function captureOob(
     )
       .bind(totalBytes, current)
       .run();
-    return oobResponse();
+    return respond();
   }
 }
 

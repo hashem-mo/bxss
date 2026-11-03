@@ -2,20 +2,28 @@ import { describe, expect, it } from 'vitest';
 import {
   MAX_OOB_BODY_BYTES,
   OOB_HEADER_VALUE_MAX_BYTES,
+  OOB_RESPONSE_BODY_MAX_BYTES,
+  OOB_RESPONSE_HEADER_MAX_COUNT,
   OOB_TOKEN_LENGTH,
   base32LowerEncode,
   boundOobHeaders,
   boundOobText,
+  canonicalOobResponse,
   createOobToken,
   encodeOobBody,
   isOobToken,
   normalizeOobWildcardHost,
   oobHostLoader,
   oobPathLoader,
+  oobResponseSpec,
   oobTokenFromHost,
   oobTokenFromPath,
   redactToken,
 } from '../src/lib/oob';
+
+function headerMap(spec: ReturnType<typeof oobResponseSpec>): Record<string, string> {
+  return Object.fromEntries(spec.headers.map(([name, value]) => [name.toLowerCase(), value]));
+}
 
 describe('OOB tokens', () => {
   it('generates DNS- and path-safe 128-bit base32 tokens', () => {
@@ -125,5 +133,62 @@ describe('OOB request bounding', () => {
     expect(encoded.truncated).toBe(true);
     expect(encoded.byteLength).toBe(MAX_OOB_BODY_BYTES + 512);
     expect(new TextEncoder().encode(encoded.body).byteLength).toBe(MAX_OOB_BODY_BYTES);
+  });
+});
+
+describe('OOB response policy', () => {
+  it('canonicalizes a valid policy and fills defaults', () => {
+    expect(canonicalOobResponse({ status: 200, body: 'hi', headers: [{ name: 'Content-Type', value: 'text/html' }] }))
+      .toEqual({ status: 200, body: 'hi', headers: [{ name: 'Content-Type', value: 'text/html' }] });
+    expect(canonicalOobResponse({ status: 204 })).toEqual({ status: 204, body: '', headers: [] });
+  });
+
+  it('rejects out-of-range status, extra keys, and oversized bodies', () => {
+    expect(canonicalOobResponse({ status: 99 })).toBeNull();
+    expect(canonicalOobResponse({ status: 600 })).toBeNull();
+    expect(canonicalOobResponse({ status: 200.5 })).toBeNull();
+    expect(canonicalOobResponse({ status: 200, extra: true })).toBeNull();
+    expect(canonicalOobResponse({ status: 200, body: 'x'.repeat(OOB_RESPONSE_BODY_MAX_BYTES + 1) })).toBeNull();
+    expect(canonicalOobResponse('nope')).toBeNull();
+  });
+
+  it('rejects header injection, forbidden headers, and over-limit header sets', () => {
+    expect(canonicalOobResponse({ status: 200, headers: [{ name: 'Bad Name', value: 'x' }] })).toBeNull();
+    expect(canonicalOobResponse({ status: 200, headers: [{ name: 'X', value: 'a\r\nInjected: 1' }] })).toBeNull();
+    expect(canonicalOobResponse({ status: 200, headers: [{ name: 'Content-Length', value: '5' }] })).toBeNull();
+    expect(canonicalOobResponse({ status: 200, headers: [{ name: 'Transfer-Encoding', value: 'chunked' }] })).toBeNull();
+    const tooMany = Array.from({ length: OOB_RESPONSE_HEADER_MAX_COUNT + 1 }, (_, i) => ({ name: `X-${i}`, value: 'v' }));
+    expect(canonicalOobResponse({ status: 200, headers: tooMany })).toBeNull();
+  });
+
+  it('builds the inert default spec for a null policy', () => {
+    const spec = oobResponseSpec(null);
+    expect(spec.status).toBe(200);
+    expect(spec.body).toBe('');
+    const headers = headerMap(spec);
+    expect(headers['content-type']).toBe('text/plain; charset=utf-8');
+    expect(headers['access-control-allow-origin']).toBe('*');
+    expect(oobResponseSpec(null, 429).status).toBe(429);
+  });
+
+  it('merges operator headers over defaults and reflects status/body', () => {
+    const spec = oobResponseSpec({
+      status: 302,
+      body: 'moved',
+      headers: [
+        { name: 'content-type', value: 'application/xml' },
+        { name: 'Location', value: 'https://authorized.internal/' },
+      ],
+    });
+    expect(spec.status).toBe(302);
+    expect(spec.body).toBe('moved');
+    const headers = headerMap(spec);
+    // Operator Content-Type overrides the default (case-insensitive).
+    expect(headers['content-type']).toBe('application/xml');
+    expect(headers['location']).toBe('https://authorized.internal/');
+    // A default the operator did not touch is still present.
+    expect(headers['access-control-allow-origin']).toBe('*');
+    // The merge must not leave two content-type entries.
+    expect(spec.headers.filter(([name]) => name.toLowerCase() === 'content-type')).toHaveLength(1);
   });
 });

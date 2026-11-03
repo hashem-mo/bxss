@@ -85,11 +85,15 @@ describe('static security invariants', () => {
     expect(oob).toContain('EXISTS (');
   });
 
-  it('returns a uniform, inert out-of-band response that never reflects input', async () => {
+  it('never reflects request input into the out-of-band response', async () => {
     const oob = await readFile(new URL('../src/routes/oob.ts', import.meta.url), 'utf8');
-    // The only Response in the capture path has an empty, fixed body.
-    expect(oob).toContain("return new Response('', {");
-    expect(oob).not.toMatch(/new Response\((?!'')/);
+    const lib = await readFile(new URL('../src/lib/oob.ts', import.meta.url), 'utf8');
+    // The only Response in the capture path is built from the resolved spec
+    // (operator-configured policy or the inert default) — never from the request.
+    expect(oob).toContain('new Response(spec.body, { status: spec.status, headers })');
+    expect(oob).not.toMatch(/new Response\((?!spec\.body)/);
+    // A listener with no custom response still serves an empty body.
+    expect(lib).toContain("return { status: fallbackStatus, headers: [...merged.values()], body: '' };");
   });
 
   it('keeps the listener token out of the non-step-up interaction summary', async () => {
@@ -102,6 +106,19 @@ describe('static security invariants', () => {
     expect(oob).toContain('path: summaryPath');
     // The full request line stays in the detail, which is step-up gated.
     expect(admin).toMatch(/app\.get\('\/oob\/interactions\/:id'[\s\S]{0,120}requireStepUp\(c\)/);
+  });
+
+  it('validates operator-controlled OOB response headers against injection', async () => {
+    const oob = await readFile(new URL('../src/lib/oob.ts', import.meta.url), 'utf8');
+    const admin = await readFile(new URL('../src/routes/admin.ts', import.meta.url), 'utf8');
+    // Field-name token + field-value restricted to visible ASCII/space/tab (no CR/LF).
+    expect(oob).toContain("const headerValuePattern = /^[\\t\\x20-\\x7e]*$/");
+    // Framing headers can never be set by an operator.
+    expect(oob).toContain("'content-length'");
+    expect(oob).toContain("'transfer-encoding'");
+    // The admin API routes the operator policy through the validator and rejects bad input.
+    expect(admin).toContain('canonicalOobResponse(body.data.response)');
+    expect(admin).toContain("'invalid_response'");
   });
 
   it('encrypts and hashes out-of-band listener tokens like collector tokens', async () => {

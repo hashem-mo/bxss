@@ -163,3 +163,125 @@ export function encodeOobBody(bytes: Uint8Array): OobBody {
     return { body: bytesToBase64Url(slice as Bytes), encoding: 'base64url', byteLength, truncated };
   }
 }
+
+// --- Per-listener response control ------------------------------------------
+
+export const OOB_RESPONSE_BODY_MAX_BYTES = 8_192;
+export const OOB_RESPONSE_HEADER_MAX_COUNT = 16;
+export const OOB_RESPONSE_HEADER_NAME_MAX = 128;
+export const OOB_RESPONSE_HEADER_VALUE_MAX = 2_048;
+
+// RFC 7230 header field-name token, and a field-value limited to visible ASCII
+// plus space/tab. Restricting the value to a ByteString with no CR/LF/NUL
+// prevents response-header injection and runtime encoding errors.
+const headerNamePattern = /^[A-Za-z0-9!#$%&'*+.^_`|~-]+$/;
+const headerValuePattern = /^[\t\x20-\x7e]*$/;
+
+// Headers whose value the runtime derives from the response itself. Letting an
+// operator set these would corrupt message framing, so they are never accepted.
+const FORBIDDEN_RESPONSE_HEADERS = new Set([
+  'content-length',
+  'content-encoding',
+  'transfer-encoding',
+  'connection',
+  'keep-alive',
+  'upgrade',
+  'te',
+  'trailer',
+  'trailers',
+]);
+
+// Applied to every OOB response and overridden only by an explicit operator
+// header of the same name. The worker additionally enforces a fixed set of
+// security headers (nosniff, framing, CORP) on top of these.
+export const OOB_DEFAULT_RESPONSE_HEADERS: ReadonlyArray<readonly [string, string]> = [
+  ['Content-Type', 'text/plain; charset=utf-8'],
+  ['Cache-Control', 'no-store'],
+  ['Access-Control-Allow-Origin', '*'],
+  ['Access-Control-Allow-Methods', 'GET, POST, PUT, PATCH, DELETE, OPTIONS, HEAD'],
+  ['Access-Control-Allow-Headers', '*'],
+  ['Access-Control-Max-Age', '600'],
+  ['X-Content-Type-Options', 'nosniff'],
+];
+
+export interface OobResponseHeader {
+  name: string;
+  value: string;
+}
+
+export interface OobResponsePolicy {
+  status: number;
+  body: string;
+  headers: OobResponseHeader[];
+}
+
+export interface OobResponseSpec {
+  status: number;
+  headers: Array<[string, string]>;
+  body: string;
+}
+
+export function isForbiddenResponseHeader(name: string): boolean {
+  return FORBIDDEN_RESPONSE_HEADERS.has(name.toLowerCase());
+}
+
+function validResponseHeader(name: string, value: string): boolean {
+  return (
+    name.length >= 1
+    && name.length <= OOB_RESPONSE_HEADER_NAME_MAX
+    && value.length <= OOB_RESPONSE_HEADER_VALUE_MAX
+    && headerNamePattern.test(name)
+    && headerValuePattern.test(value)
+    && !isForbiddenResponseHeader(name)
+  );
+}
+
+/**
+ * Validates an operator-supplied response policy into a canonical shape, or
+ * returns null if anything is out of bounds. Rejecting (rather than silently
+ * dropping) keeps the admin API honest about what it stored.
+ */
+export function canonicalOobResponse(value: unknown): OobResponsePolicy | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const record = value as Record<string, unknown>;
+  for (const key of Object.keys(record)) {
+    if (key !== 'status' && key !== 'body' && key !== 'headers') return null;
+  }
+  const { status } = record;
+  if (typeof status !== 'number' || !Number.isInteger(status) || status < 100 || status > 599) return null;
+  const body = record.body === undefined ? '' : record.body;
+  if (typeof body !== 'string' || utf8(body).byteLength > OOB_RESPONSE_BODY_MAX_BYTES) return null;
+  const rawHeaders = record.headers === undefined ? [] : record.headers;
+  if (!Array.isArray(rawHeaders) || rawHeaders.length > OOB_RESPONSE_HEADER_MAX_COUNT) return null;
+  const headers: OobResponseHeader[] = [];
+  for (const item of rawHeaders) {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) return null;
+    const entry = item as Record<string, unknown>;
+    if (Object.keys(entry).length !== 2 || typeof entry.name !== 'string' || typeof entry.value !== 'string') {
+      return null;
+    }
+    if (!validResponseHeader(entry.name, entry.value)) return null;
+    headers.push({ name: entry.name, value: entry.value });
+  }
+  return { status, body, headers };
+}
+
+/**
+ * Builds the concrete response spec served to a caller. A null policy yields the
+ * inert default (empty body, 200, permissive CORS). A policy overrides the
+ * status and body and merges its headers over the defaults by name; forbidden
+ * or malformed headers are skipped defensively even though the admin API should
+ * have rejected them already.
+ */
+export function oobResponseSpec(policy: OobResponsePolicy | null, fallbackStatus = 200): OobResponseSpec {
+  const merged = new Map<string, [string, string]>();
+  for (const [name, value] of OOB_DEFAULT_RESPONSE_HEADERS) merged.set(name.toLowerCase(), [name, value]);
+  if (!policy) {
+    return { status: fallbackStatus, headers: [...merged.values()], body: '' };
+  }
+  for (const header of policy.headers) {
+    if (!validResponseHeader(header.name, header.value)) continue;
+    merged.set(header.name.toLowerCase(), [header.name, header.value]);
+  }
+  return { status: policy.status, headers: [...merged.values()], body: policy.body };
+}

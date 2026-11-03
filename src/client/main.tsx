@@ -63,6 +63,12 @@ interface Collector {
   updatedAt: number;
 }
 
+interface OobResponseConfig {
+  status: number;
+  body: string;
+  headers: Array<{ name: string; value: string }>;
+}
+
 interface OobProbe {
   id: string;
   name: string;
@@ -73,6 +79,7 @@ interface OobProbe {
   enabled: boolean;
   discordNotifications: boolean;
   discordConfigured: boolean;
+  response: OobResponseConfig | null;
   createdAt: number;
   updatedAt: number;
 }
@@ -871,6 +878,20 @@ function normalizeCollector(value: unknown): Collector {
   };
 }
 
+function normalizeOobResponse(value: unknown): OobResponseConfig | null {
+  if (value === null || value === undefined) return null;
+  const row = asMap(value);
+  if (!('status' in row)) return null;
+  return {
+    status: numberValue(row.status, 200),
+    body: stringValue(row.body),
+    headers: asList(row.headers)
+      .map((item) => asMap(item))
+      .map((item) => ({ name: stringValue(item.name), value: stringValue(item.value) }))
+      .filter((header) => header.name),
+  };
+}
+
 function normalizeOobProbe(value: unknown): OobProbe {
   const row = asMap(value);
   return {
@@ -883,6 +904,7 @@ function normalizeOobProbe(value: unknown): OobProbe {
     enabled: booleanValue(row.enabled, true),
     discordNotifications: booleanValue(row.discordNotifications ?? row.discord_notifications),
     discordConfigured: booleanValue(row.discordConfigured ?? row.discord_configured),
+    response: normalizeOobResponse(row.response),
     createdAt: numberValue(row.createdAt || row.created_at),
     updatedAt: numberValue(row.updatedAt || row.updated_at),
   };
@@ -2395,6 +2417,11 @@ function OobPage({ notify }: { notify: (tone: Notice['tone'], message: string) =
   const [clearing, setClearing] = useState(false);
   const [selectedInteraction, setSelectedInteraction] = useState<OobInteraction | null>(null);
 
+  const [responseEnabled, setResponseEnabled] = useState(false);
+  const [responseStatus, setResponseStatus] = useState('200');
+  const [responseHeadersText, setResponseHeadersText] = useState('');
+  const [responseBody, setResponseBody] = useState('');
+
   const selected = probes.find((probe) => probe.id === selectedId) || probes[0] || null;
 
   const load = useCallback(async () => {
@@ -2441,11 +2468,18 @@ function OobPage({ notify }: { notify: (tone: Notice['tone'], message: string) =
   useEffect(() => {
     setReveal(false);
     setSelectedInteraction(null);
+    const response = selected?.response ?? null;
+    setResponseEnabled(Boolean(response));
+    setResponseStatus(response ? String(response.status) : '200');
+    setResponseBody(response ? response.body : '');
+    setResponseHeadersText(response ? response.headers.map((header) => `${header.name}: ${header.value}`).join('\n') : '');
     if (selected?.id) void loadInteractions(selected.id);
     else {
       setInteractions([]);
       setInteractionCursor('');
     }
+    // selected.response is read only when the selected listener changes (by id).
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selected?.id, loadInteractions]);
 
   function patchLocal(patch: Partial<OobProbe>) {
@@ -2479,14 +2513,32 @@ function OobPage({ notify }: { notify: (tone: Notice['tone'], message: string) =
     if (!selected) return;
     setSaving(true);
     setError('');
+    const response: OobResponseConfig | null = responseEnabled
+      ? {
+          status: Number.parseInt(responseStatus, 10) || 200,
+          body: responseBody,
+          headers: responseHeadersText
+            .split(/\r?\n/)
+            .map((line) => {
+              const index = line.indexOf(':');
+              if (index === -1) return null;
+              const name = line.slice(0, index).trim();
+              const value = line.slice(index + 1).trim();
+              return name ? { name, value } : null;
+            })
+            .filter((header): header is { name: string; value: string } => header !== null),
+        }
+      : null;
     const body = {
       name: selected.name.trim(),
       enabled: selected.enabled,
       discordNotifications: selected.discordConfigured ? selected.discordNotifications : false,
+      response,
     };
     try {
-      await apiJson(API + '/oob/' + encodeURIComponent(selected.id), { method: 'PATCH', body });
-      patchLocal({ discordNotifications: body.discordNotifications });
+      const payload = asMap(await apiJson(API + '/oob/' + encodeURIComponent(selected.id), { method: 'PATCH', body }));
+      const saved = normalizeOobProbe(payload.probe);
+      patchLocal({ discordNotifications: body.discordNotifications, response: saved.id ? saved.response : response });
       notify('success', 'Listener settings saved.');
     } catch (caught) {
       setError(friendlyError(caught));
@@ -2685,6 +2737,57 @@ function OobPage({ notify }: { notify: (tone: Notice['tone'], message: string) =
                     : 'Set the DISCORD_WEBHOOK_URL Cloudflare secret, redeploy, then refresh this page.'}
                   disabled={!selected.discordConfigured}
                 />
+              </div>
+              <div className="notification-settings">
+                <div className="section-title-row">
+                  <div>
+                    <h3>Response</h3>
+                    <p>What this listener returns to callers. Off by default — an empty <code>200</code>.</p>
+                  </div>
+                </div>
+                <Toggle
+                  checked={responseEnabled}
+                  onChange={setResponseEnabled}
+                  label="Serve a custom response"
+                  detail="Control the status code, headers, and body. Use a 3xx status with a Location header to redirect. Capture still happens regardless of what is returned."
+                />
+                {responseEnabled && (
+                  <>
+                    <div className="settings-grid">
+                      <label>
+                        <span>Status code</span>
+                        <input
+                          type="number"
+                          min={100}
+                          max={599}
+                          value={responseStatus}
+                          onChange={(e) => setResponseStatus(e.target.value)}
+                        />
+                        <small>100–599. For a redirect use e.g. 302 plus a <code>Location</code> header.</small>
+                      </label>
+                      <label>
+                        <span>Response headers</span>
+                        <textarea
+                          value={responseHeadersText}
+                          onChange={(e) => setResponseHeadersText(e.target.value)}
+                          rows={5}
+                          placeholder={'Content-Type: application/xml\nLocation: https://authorized.internal/'}
+                        />
+                        <small>One <code>Name: Value</code> per line (max 16). Content-Length and Transfer-Encoding are managed for you.</small>
+                      </label>
+                    </div>
+                    <label className="settings-name">
+                      <span>Response body</span>
+                      <textarea
+                        value={responseBody}
+                        onChange={(e) => setResponseBody(e.target.value)}
+                        rows={5}
+                        placeholder={'<?xml version="1.0"?><!DOCTYPE t [ ... ]>'}
+                      />
+                      <small>Up to 8 KiB, served verbatim. Served on your collector origin, so only use authorized content.</small>
+                    </label>
+                  </>
+                )}
               </div>
               <div className="panel-actions">
                 <button className="button button-danger-quiet" type="button" onClick={removeProbe} disabled={deleting || saving}>
